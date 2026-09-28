@@ -1,6 +1,6 @@
 // 消息管道（清单 §6、§9、§11、§15、§16）。
 
-import { Context, Logger, Universal } from 'koishi'
+import { Context, h, Logger, Universal } from 'koishi'
 import type { Element, Session } from 'koishi'
 import type {} from '@satorijs/adapter-discord'
 import { AtAllGate } from './atall'
@@ -370,6 +370,7 @@ export class Relay {
       if (!prepared) return this.fail(bridge, 'd2q', '预处理超过 60 秒')
       const msg = prepared.msg
       if (!msg || prepared.skip || prepared.blocked.has(bridge.key)) return
+      await this.loaded
       if (this.isPaused(bridge)) return
       const bot = this.qqBot()
       // @全体（清单 §11）
@@ -377,6 +378,15 @@ export class Relay {
       if (bridge.atAll && msg.mentionEveryone && bridge.direction !== 'q2d') {
         if (!bot || !qqOnline(bot)) atAll = { ok: false, reason: '查询失败' }
         else atAll = await this.gate.decide(bot, bridge.qq, msg)
+        // 在发送之前就记下次数；已经超时或记不下来时改发文字
+        if (atAll.ok && this.now() >= deadline) atAll = { ok: false, reason: '查询失败' }
+        if (atAll.ok) {
+          try {
+            await atAll.commit()
+          } catch {
+            atAll = { ok: false, reason: '查询失败' }
+          }
+        }
         if (!atAll.ok) {
           this.stats.atAllFallback(bridge.qq, this.dateOf(this.now()), atAll.reason)
           this.logger.info(`QQ 群 ${bridge.qq} 没有 @全体（${atAll.reason}），改发文字`)
@@ -400,33 +410,38 @@ export class Relay {
         images: prepared.images.map((image) => ('data' in image ? { data: image.data, mime: image.mime } : { placeholder: image.placeholder })),
         videos: prepared.videos.map((video) => ({ url: video.url, placeholder: video.placeholder })),
       })
-      if (!sends.length) return
-      if (atAll?.ok) await atAll.commit()
+      if (!sends.length) {
+        if (atAll?.ok) await atAll.revert().catch(() => {})
+        return
+      }
       let part = 0
+      let failure = ''
       for (let i = 0; i < sends.length; i++) {
         if (this.now() >= deadline) {
-          this.fail(bridge, 'd2q', '超过 60 秒，后面的分段没有发出')
+          if (i === 0 && atAll?.ok) await atAll.revert().catch(() => {})
+          failure = '超过 60 秒，后面的分段没有发出'
           break
         }
         const result = await sendQQ(() => this.qqBot(), bridge.qq, sends[i], { signal: controller.signal, deadline, sleep: this.sleep })
-        if (i === 0 && atAll?.ok && !result.ok && !result.maybeSent) await atAll.revert()
+        if (i === 0 && atAll?.ok && !result.ok && !result.maybeSent) await atAll.revert().catch(() => {})
         if (result.ok) {
           await this.record(msg, 'onebot', bridge.qq, result.messageId, part++)
-          this.stats.forwarded(bridge.key)
-        } else {
-          // 视频发送失败：改发文字
-          const video = this.videoOf(sends[i], prepared)
-          if (video && !result.maybeSent) {
-            const fallback = await sendQQ(() => this.qqBot(), bridge.qq, [textElement(video.placeholder)], { signal: controller.signal, deadline, sleep: this.sleep })
-            if (fallback.ok) {
-              await this.record(msg, 'onebot', bridge.qq, fallback.messageId, part++)
-              continue
-            }
-          }
-          this.fail(bridge, 'd2q', result.reason, msg.messageId)
-          if (!result.maybeSent && i === 0) break
+          continue
         }
+        // 视频发送失败：改发文字（这是另一条消息，不算重试）
+        const video = this.videoOf(sends[i], prepared)
+        if (video && result.reason !== 'QQ 未连接') {
+          const fallback = await sendQQ(() => this.qqBot(), bridge.qq, [h.text(video.placeholder)], { signal: controller.signal, deadline, sleep: this.sleep })
+          if (fallback.ok) {
+            await this.record(msg, 'onebot', bridge.qq, fallback.messageId, part++)
+            continue
+          }
+        }
+        failure = result.reason
+        this.logger.warn(`转发失败 [第 ${bridge.index} 个桥 d2q 消息 ${msg.messageId} 第 ${i + 1} 段]：${result.reason}`)
+        if (!result.maybeSent && i === 0) break
       }
+      this.count(bridge, part > 0, failure)
     } finally {
       clearTimeout(timer)
     }
@@ -532,17 +547,37 @@ export class Relay {
       if (!prepared) return this.fail(bridge, 'q2d', '预处理超过 60 秒')
       const msg = prepared.msg
       if (!msg || prepared.skip || prepared.blocked.has(bridge.key)) return
+      await this.loaded
       if (this.isPaused(bridge)) return
       const bot = this.discordBot()
       if (!bot) return this.fail(bridge, 'q2d', this.botProblem('discord') ?? '没有 Discord 机器人')
-      const webhook: Webhook | null = this.settings.discordAsWebhook ? await this.sender.tryWebhook(bot, bridge.discord) : null
+      const limit = () => Math.max(0, Math.min(15000, deadline - this.now()))
+      // 取 webhook 也受 60 秒限制；超时就当作 webhook 用不了（改由机器人发）
+      let webhook: Webhook | null = this.settings.discordAsWebhook ? await timed(this.sender.tryWebhook(bot, bridge.discord), limit(), null) : null
+      const found = msg.reply ? await this.findReplyTarget(msg.channelId, msg.reply.messageId, bridge.discord) : {}
+      const link = found.targetId ? await timed(this.messageLink(bot, bridge.discord, found.targetId), limit(), undefined) : undefined
+      let result = await this.sendToDiscord(bot, bridge, msg, prepared, webhook, found, link, deadline, controller.signal)
+      // webhook 失效又重建不了：改由机器人发（DECISIONS 第 9 条）
+      if (result === 'webhookGone') {
+        webhook = null
+        result = await this.sendToDiscord(bot, bridge, msg, prepared, null, found, link, deadline, controller.signal)
+      }
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  private async sendToDiscord(
+    bot: any, bridge: Bridge, msg: Msg, prepared: Prepared, webhook: Webhook | null,
+    found: { targetId?: string; forwardedFrom?: MessageRow }, link: string | undefined, deadline: number, signal: AbortSignal,
+  ): Promise<'done' | 'webhookGone'> {
+    {
       // 回复（清单 §9）
       let line: string | undefined
       let replyTo: string | undefined
       if (msg.reply) {
-        const found = await this.findReplyTarget(msg.channelId, msg.reply.messageId, bridge.discord)
         if (found.targetId && !webhook) replyTo = found.targetId
-        else if (found.targetId) line = this.replyText(msg, found.forwardedFrom, await this.messageLink(bot, bridge.discord, found.targetId))
+        else if (found.targetId) line = this.replyText(msg, found.forwardedFrom, link)
         else line = this.replyText(msg, found.forwardedFrom)
       }
       const files = prepared.images.filter((x): x is FileData & { placeholder: string } => 'data' in x)
@@ -552,7 +587,7 @@ export class Relay {
         replyLine: line,
         text: [fullText(msg), ...placeholders].filter(Boolean).join('\n'),
       })
-      if (!contents.length && !files.length) return
+      if (!contents.length && !files.length) return 'done'
       if (!contents.length) contents.push('')
       const username = webhook ? webhookUsername(bridge.label, msg.author) : undefined
       // 文件跟着最后一段；一次最多 10 个，多的另起一次发送
@@ -563,9 +598,10 @@ export class Relay {
         else batches.push({ content: '', files: chunk })
       }
       let part = 0
+      let failure = ''
       for (let i = 0; i < batches.length; i++) {
         if (this.now() >= deadline) {
-          this.fail(bridge, 'q2d', '超过 60 秒，后面的分段没有发出', msg.messageId)
+          failure = '超过 60 秒，后面的分段没有发出'
           break
         }
         const result = await this.sender.send(bot, bridge.discord, {
@@ -574,18 +610,19 @@ export class Relay {
           avatarUrl: msg.avatar,
           replyTo: i === 0 ? replyTo : undefined,
           files: batches[i].files,
-        }, webhook, { signal: controller.signal, deadline, sleep: this.sleep })
+        }, webhook, { signal, deadline, sleep: this.sleep })
         if (result.ok) {
           this.sentIds.add(result.messageId)
           await this.record(msg, 'discord', bridge.discord, result.messageId, part++)
-          this.stats.forwarded(bridge.key)
-        } else {
-          this.fail(bridge, 'q2d', result.reason, msg.messageId)
-          if (!result.maybeSent && i === 0) break
+          continue
         }
+        if (result.webhookGone && i === 0) return 'webhookGone'
+        failure = result.reason
+        this.logger.warn(`转发失败 [第 ${bridge.index} 个桥 q2d 消息 ${msg.messageId} 第 ${i + 1} 段]：${result.reason}`)
+        if (!result.maybeSent && i === 0) break
       }
-    } finally {
-      clearTimeout(timer)
+      this.count(bridge, part > 0, failure)
+      return 'done'
     }
   }
 
@@ -637,6 +674,12 @@ export class Relay {
     }
   }
 
+  /** 每条消息每个桥只统计一次（清单 §13：24 小时转发数和失败数）。 */
+  private count(bridge: Bridge, delivered: boolean, failure: string) {
+    if (delivered) this.stats.forwarded(bridge.key)
+    if (failure) this.stats.failed(bridge.key, failure)
+  }
+
   private fail(bridge: Bridge, direction: Direction, reason: string, messageId?: string) {
     this.stats.failed(bridge.key, reason)
     this.logger.warn(`转发失败 [第 ${bridge.index} 个桥 ${direction}${messageId ? ` 消息 ${messageId}` : ''}]：${reason}`)
@@ -648,7 +691,8 @@ export class Relay {
     const cached = this.channelInfo.get(channelId)
     if (cached) return cached
     try {
-      const raw = await bot?.internal?.getChannel(channelId)
+      const raw = await timed<any, undefined>(bot?.internal?.getChannel(channelId), 10000, undefined)
+      if (raw === undefined) return {}
       const info = { name: raw?.name, guildId: raw?.guild_id }
       if (info.guildId) this.guildOf.set(channelId, info.guildId)
       this.channelInfo.set(channelId, info)
@@ -664,7 +708,7 @@ export class Relay {
     if (cached) return cached
     const map = new Map<string, string>()
     try {
-      for (const role of await bot?.internal?.getGuildRoles(guildId) ?? []) map.set(String(role.id), String(role.name))
+      for (const role of await timed<any[], any[]>(bot?.internal?.getGuildRoles(guildId), 10000, []) ?? []) map.set(String(role.id), String(role.name))
     } catch {}
     this.roleNames.set(guildId, map)
     return map
@@ -802,8 +846,13 @@ function fullText(msg: Msg) {
   return [msg.body, ...msg.blocks].filter((s) => s.trim() !== '').join('\n\n')
 }
 
-function textElement(content: string): Element {
-  return { type: 'text', attrs: { content }, children: [] } as any
+/** 最多等 ms 毫秒，超时或出错返回 fallback。 */
+function timed<T, F>(promise: Promise<T> | undefined, ms: number, fallback: F): Promise<T | F> {
+  if (!promise) return Promise.resolve(fallback)
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(fallback), ms)
+    promise.then((value) => resolve(value), () => resolve(fallback)).finally(() => clearTimeout(timer))
+  })
 }
 
 function sleepUntil(deadline: number, now: () => number) {

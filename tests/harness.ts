@@ -162,6 +162,8 @@ export class FakeQQ {
   /** 某个动作下一次（或每次）的结果：'timeout' | 'fail' | 自定义 data。 */
   faults = new Map<string, 'timeout' | 'fail' | 'throw'>()
   messages = new Map<string, any>()
+  /** 带视频段的发送一律失败（LLBot 下载视频失败时的样子）。 */
+  failVideo = false
   private messageId = 7000
 
   text(group = QQ_GROUP) {
@@ -192,6 +194,9 @@ export class FakeQQ {
       case 'send_private_msg':
         return ok({ message_id: ++this.messageId })
       case 'send_group_msg': {
+        if (this.failVideo && Array.isArray(params.message) && params.message.some((seg: any) => seg.type === 'video')) {
+          return { status: 'failed', retcode: 1200, data: null }
+        }
         const id = String(++this.messageId)
         const segments = params.message
         this.sent.push({ group: String(params.group_id), segments, text: flatten(segments), id })

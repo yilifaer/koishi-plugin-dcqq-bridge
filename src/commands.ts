@@ -54,7 +54,7 @@ export function findBridges(relay: Relay, target: string): { bridges: Bridge[]; 
   return named.length ? { bridges: named } : { bridges: [], error: `没有找到桥「${text}」` }
 }
 
-export function statusText(relay: Relay, filter: (b: { discord: string; qq: string }) => boolean, all = true): string {
+export async function statusText(relay: Relay, filter: (b: { discord: string; qq: string }) => boolean, all = true): Promise<string> {
   const lines: string[] = []
   const settings = relay.settings
   const time = timeFormatter(settings.timeZone)
@@ -91,7 +91,8 @@ export function statusText(relay: Relay, filter: (b: { discord: string; qq: stri
     if (bridge.atAll) {
       const remain = relay.gate.remain.get(bridge.qq)
       const fallbacks = [...relay.stats.atAllFallbacks(bridge.qq, date)].map(([reason, n]) => `${reason} ${n}`).join('、')
-      lines.push(`   @全体：今天剩余 ${remain ? `${remain.forUin} / ${remain.forGroup}（机器人 / 全群）` : '未知'}${fallbacks ? `，改发文字：${fallbacks}` : ''}`)
+      const used = await relay.gate.usedToday(bridge.qq).catch(() => undefined)
+      lines.push(`   @全体：今天用了 ${used ?? '?'} 次，剩余 ${remain ? `${remain.forUin} / ${remain.forGroup}（机器人 / 全群）` : '未知'}${fallbacks ? `，改发文字：${fallbacks}` : ''}`)
     }
   }
   if (!shown) lines.push('没有相关的桥。')
@@ -121,7 +122,7 @@ export function registerCommands(ctx: Context, relay: Relay) {
         // 私聊不带 -a：只显示启用的桥；带 -a 连无效、未启用的行也显示
         all = false
       }
-      await reply(session, statusText(relay, filter, all))
+      await reply(session, await statusText(relay, filter, all))
     })
 
   const pauseAction = (paused: boolean) => async ({ session }: { session?: Session }, target?: string) => {

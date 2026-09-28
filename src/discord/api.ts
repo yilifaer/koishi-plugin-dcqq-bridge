@@ -24,7 +24,7 @@ export interface DiscordPayload {
 
 export type SendResult =
   | { ok: true; messageId: string }
-  | { ok: false; reason: string; maybeSent: boolean }
+  | { ok: false; reason: string; maybeSent: boolean; webhookGone?: boolean }
 
 export interface SendOptions {
   signal: AbortSignal
@@ -220,7 +220,7 @@ export class DiscordSender {
             try {
               wh = await this.ensureWebhook(bot, channelId, true)
             } catch (e) {
-              return { ok: false, reason: `webhook 已失效，重新创建失败：${describeError(e)}`, maybeSent: false }
+              return { ok: false, reason: `webhook 已失效，重新创建失败：${describeError(e)}`, maybeSent: false, webhookGone: true }
             }
             continue
           default:
