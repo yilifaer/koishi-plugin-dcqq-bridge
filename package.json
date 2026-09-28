@@ -1,0 +1,70 @@
+{
+  "name": "koishi-plugin-dcqq-bridge",
+  "version": "0.1.0",
+  "description": "Discord 频道与 QQ 群（OneBot）之间的消息转发：完整渲染 embed、换算时间码、@全体、防 ping、失败降级",
+  "main": "lib/index.js",
+  "typings": "lib/index.d.ts",
+  "files": [
+    "lib",
+    "README.md",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yilifaer/koishi-plugin-dcqq-bridge.git"
+  },
+  "homepage": "https://github.com/yilifaer/koishi-plugin-dcqq-bridge#readme",
+  "bugs": {
+    "url": "https://github.com/yilifaer/koishi-plugin-dcqq-bridge/issues"
+  },
+  "keywords": [
+    "chatbot",
+    "koishi",
+    "plugin",
+    "discord",
+    "qq",
+    "onebot",
+    "bridge",
+    "forward",
+    "relay"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build"
+  },
+  "peerDependencies": {
+    "koishi": "^4.18.0"
+  },
+  "koishi": {
+    "description": {
+      "zh": "Discord 频道与 QQ 群之间的消息转发：embed、时间码、@全体、防 ping、失败降级",
+      "en": "Bridge Discord channels and QQ groups (OneBot): full embeds, timestamps, @all, ping-safe, graceful fallback"
+    },
+    "service": {
+      "required": [
+        "database"
+      ]
+    }
+  },
+  "devDependencies": {
+    "@koishijs/plugin-database-memory": "^3.7.0",
+    "@koishijs/plugin-http": "^0.6.3",
+    "@satorijs/adapter-discord": "4.6.2",
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^22.20.4",
+    "koishi": "4.18.11",
+    "koishi-plugin-adapter-onebot": "6.9.4",
+    "typescript": "^5.9.3",
+    "vite": "^6.4.3",
+    "vitest": "^3.2.7"
+  },
+  "dependencies": {
+    "js-yaml": "^4.3.2"
+  }
+}
