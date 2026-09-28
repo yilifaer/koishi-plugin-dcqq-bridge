@@ -86,7 +86,7 @@ export function statusText(relay: Relay, filter: (b: { discord: string; qq: stri
     const parts = [`${head} ${state}`, `最近转发 ${time(stats.lastForwardAt)}`, `24 小时 ${stats.forwards} 条 / 失败 ${stats.failures}`]
     lines.push(parts.join('，'))
     if (stats.lastFailure) lines.push(`   最近一次失败：${stats.lastFailure.reason}（${time(stats.lastFailure.at)}）`)
-    for (const problem of relay.health.get(bridge.key) ?? []) lines.push(`   ⚠ ${problem}`)
+    for (const problem of relay.health.get(bridge.key) ?? []) lines.push(`   ${problem.startsWith('⚠') ? problem : `⚠ ${problem}`}`)
     for (const warning of row.warnings) lines.push(`   ⚠ ${warning}`)
     if (bridge.atAll) {
       const remain = relay.gate.remain.get(bridge.qq)

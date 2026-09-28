@@ -3,6 +3,8 @@
 
 import type { FileData } from '../types'
 import { describeError, internalErrorInfo } from '../log'
+import { escapeDiscord } from '../out/discord'
+import { cutUnits } from '../text/split'
 
 export interface Webhook {
   id: string
@@ -110,9 +112,13 @@ function dropLargest(payload: DiscordPayload): DiscordPayload {
     if (file.data.byteLength > payload.files[largest].data.byteLength) largest = i
   })
   const dropped = payload.files[largest]
+  const placeholder = escapeDiscord(dropped.placeholder)
+  // 加上占位文字后仍不能超过 2000 字，放不下时截掉正文末尾
+  const room = 2000 - placeholder.length - 1
+  const content = payload.content ? `${cutUnits(payload.content, room)}\n${placeholder}` : placeholder
   return {
     ...payload,
-    content: payload.content ? `${payload.content}\n${dropped.placeholder}` : dropped.placeholder,
+    content,
     files: payload.files.filter((_, i) => i !== largest),
   }
 }

@@ -189,6 +189,8 @@ export class FakeQQ {
         const message = this.messages.get(String(params.message_id))
         return message ? ok(message) : { status: 'failed', retcode: 1200, data: null }
       }
+      case 'send_private_msg':
+        return ok({ message_id: ++this.messageId })
       case 'send_group_msg': {
         const id = String(++this.messageId)
         const segments = params.message
