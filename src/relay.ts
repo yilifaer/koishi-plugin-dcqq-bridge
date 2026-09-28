@@ -71,6 +71,7 @@ export class Relay {
   private guildOf = new Map<string, string>()
   private reorder = new Map<string, Array<{ seq?: number; arrival: number; release: () => void }>>()
   private disposed = false
+  private warnedNoSeq = false
   private loaded: Promise<void>
   private checkTimer: NodeJS.Timeout | null = null
   private dateOf: (ms: number) => string
@@ -458,6 +459,10 @@ export class Relay {
     const group = session.channelId!
     const seqRaw = Number((session as any).onebot?.message_seq)
     const item = { seq: Number.isFinite(seqRaw) ? seqRaw : undefined, arrival: this.now(), release }
+    if (item.seq === undefined && !this.warnedNoSeq) {
+      this.warnedNoSeq = true
+      this.logger.info('QQ 消息没有带消息序号（message_seq），重排只能按到达顺序')
+    }
     let list = this.reorder.get(group)
     if (!list) this.reorder.set(group, list = [])
     list.push(item)
