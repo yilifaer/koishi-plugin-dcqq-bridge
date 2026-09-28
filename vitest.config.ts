@@ -20,6 +20,6 @@ export default defineConfig({
     include: ['tests/**/*.test.ts'],
     testTimeout: 20000,
     // 故意用一个不是 UTC+8 的时区，证明时间码换算不依赖本机时区（清单 S18、B4）
-    env: { TZ: 'Australia/Adelaide' },
+    env: { TZ: 'Asia/Kolkata' },
   },
 })
