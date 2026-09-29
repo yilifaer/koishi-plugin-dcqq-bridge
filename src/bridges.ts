@@ -1,6 +1,6 @@
 // 配置的运行时检查（清单 §4、§0「配置出错的原则」）：坏的一行跳过、写日志、在 bridge.status 里标出来，其他照常工作。
 
-import type { AtAllConfig, BridgeRow, Config, Direction } from './config'
+import type { AtAllConfig, BridgeRow, Config, Direction, GlossaryDir, GlossaryMode } from './config'
 import { isValidTimeZone } from './discord/timestamp'
 
 export interface Bridge {
@@ -11,6 +11,8 @@ export interface Bridge {
   qq: string
   direction: Direction
   atAll: boolean
+  /** 这个桥打开了翻译（还要看总开关）。 */
+  translate: boolean
   /** 编译好的屏蔽词。 */
   blockWords: RegExp[]
   /** 桥的唯一标识：`<discord>:<qq>`。 */
@@ -32,6 +34,32 @@ export interface RowStatus {
   bridge: Bridge | null
 }
 
+export interface TranslateSettings {
+  /** 实际是否启用：总开关打开，并且接口地址和模型都填了。 */
+  enabled: boolean
+  baseURL: string
+  apiKey: string
+  model: string
+  label: string
+  timeoutMs: number
+  maxPerHour: number
+}
+
+export interface FilterSettings {
+  keywords: string
+  keywordFile: string
+  moderation: boolean
+  moderationBaseURL: string
+  moderationApiKey: string
+}
+
+export interface GlossarySettings {
+  eve: boolean
+  systemStyle: 'en(zh)' | 'en' | 'zh'
+  slangFile: string
+  overrides: Array<{ en: string; zh: string; mode: GlossaryMode; dir: GlossaryDir }>
+}
+
 export interface Settings {
   discordSelfId: string
   qqSelfId: string
@@ -41,6 +69,9 @@ export interface Settings {
   authority: number
   qqReorderMs: number
   atAll: AtAllConfig
+  translate: TranslateSettings
+  filter: FilterSettings
+  glossary: GlossarySettings
   rows: RowStatus[]
   bridges: Bridge[]
   /** 全局问题（例如时区写错）。 */
@@ -89,6 +120,40 @@ export function normalizeSettings(config: Partial<Config>): Settings {
     timeZone = 'UTC'
   }
   const atAll: any = config.atAll && typeof config.atAll === 'object' ? config.atAll : {}
+  const tr: any = config.translate && typeof config.translate === 'object' ? config.translate : {}
+  const fl: any = config.filter && typeof config.filter === 'object' ? config.filter : {}
+  const gl: any = config.glossary && typeof config.glossary === 'object' ? config.glossary : {}
+  // 标注去掉空白和零宽字符后为空，就用【机翻】（清单 §4.4）
+  let label = text(tr.label, '【机翻】').trim()
+  if (!label.replace(/[\s\p{Cf}\u034f\u115f\u1160\u3164\uffa0]/gu, '')) {
+    if (tr.label !== undefined) problems.push('译文标注不能为空，已改用「【机翻】」')
+    label = '【机翻】'
+  }
+  const translate: TranslateSettings = {
+    enabled: tr.enabled === true,
+    baseURL: text(tr.baseURL).trim().replace(/\/+$/, ''),
+    apiKey: text(tr.apiKey).trim(),
+    model: text(tr.model).trim(),
+    label,
+    timeoutMs: clampInt(tr.timeoutMs, 6000, 1000, 60000),
+    maxPerHour: clampInt(tr.maxPerHour, 0, 0, 1000000),
+  }
+  if (translate.enabled && (!translate.baseURL || !translate.model)) {
+    problems.push('翻译已打开，但没有填接口地址或模型，按关闭处理')
+    translate.enabled = false
+  }
+  const MODES: GlossaryMode[] = ['keep', 'force', 'hint']
+  const DIRS: GlossaryDir[] = ['both', 'en2zh', 'zh2en']
+  const overrides: GlossarySettings['overrides'] = []
+  for (const [i, raw] of (Array.isArray(gl.overrides) ? gl.overrides : []).entries()) {
+    const en = text(raw?.en).trim()
+    const zh = text(raw?.zh).trim()
+    if (!en || !zh || !MODES.includes(raw?.mode) || !DIRS.includes(raw?.dir)) {
+      problems.push(`术语表自定义词条第 ${i + 1} 行无效，已跳过`)
+      continue
+    }
+    overrides.push({ en, zh, mode: raw.mode, dir: raw.dir })
+  }
   const settings: Settings = {
     discordSelfId: text(config.discordSelfId).trim(),
     qqSelfId: text(config.qqSelfId).trim(),
@@ -103,6 +168,20 @@ export function normalizeSettings(config: Partial<Config>): Settings {
       dailyCap: clampInt(atAll.dailyCap, 0, 0, 1000),
       cooldownMinutes: clampInt(atAll.cooldownMinutes, 0, 0, 100000),
       maxAgeMinutes: clampInt(atAll.maxAgeMinutes, 10, 0, 100000),
+    },
+    translate,
+    filter: {
+      keywords: text(fl.keywords),
+      keywordFile: text(fl.keywordFile).trim(),
+      moderation: fl.moderation === true,
+      moderationBaseURL: (text(fl.moderationBaseURL).trim() || 'https://api.openai.com/v1').replace(/\/+$/, ''),
+      moderationApiKey: text(fl.moderationApiKey).trim(),
+    },
+    glossary: {
+      eve: gl.eve === true,
+      systemStyle: ['en(zh)', 'en', 'zh'].includes(gl.systemStyle) ? gl.systemStyle : 'en(zh)',
+      slangFile: text(gl.slangFile).trim(),
+      overrides,
     },
     rows: [],
     bridges: [],
@@ -157,6 +236,7 @@ export function normalizeSettings(config: Partial<Config>): Settings {
       qq: status.qq,
       direction: status.direction,
       atAll: row.atAll === true,
+      translate: row.translate === true,
       blockWords: patterns,
       key,
     }

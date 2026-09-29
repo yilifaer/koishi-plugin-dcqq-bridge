@@ -152,8 +152,9 @@ export function isPublicUrl(url: string | undefined): url is string {
   return true
 }
 
-function envFor(mentions: RawMessage['mentions'], opts: RenderOptions, roles = true): ContentEnv {
+function envFor(mentions: RawMessage['mentions'], opts: RenderOptions, roles = true, onToken?: (s: string) => void): ContentEnv {
   return {
+    onToken,
     timeZone: opts.timeZone,
     now: opts.now,
     userName(id) {
@@ -179,18 +180,22 @@ function imageMedia(urls: string[], name = '', extra: Partial<Media> = {}): Medi
   return { kind: 'image', urls, name, placeholder: '[图片]', ...extra }
 }
 
-/** 一个 embed → 文字块（§7.2）。链接预览返回 null。图片放进 media。 */
-function renderEmbed(e: RawEmbed, env: ContentEnv, media: Media[]): string | null {
+/** 一个 embed → 文字块（§7.2）。链接预览返回 null。图片放进 media；标题、描述、字段名和值另外放进 tr（翻译输入）。 */
+function renderEmbed(e: RawEmbed, env: ContentEnv, media: Media[], tr: string[]): string | null {
   if (e.type && e.type !== 'rich') return null
   const lines: string[] = []
   if (e.author?.name) lines.push(e.author.name)
   const title = e.title ? renderContent(e.title, env) : ''
   if (title || e.url) lines.push([title, e.url].filter(Boolean).join(' '))
-  if (e.description) lines.push(renderContent(e.description, env))
+  const desc = e.description ? renderContent(e.description, env) : ''
+  if (e.description) lines.push(desc)
+  tr.push(title, desc)
   for (const f of e.fields ?? []) {
     const name = renderContent(f.name ?? '', env)
+    const raw = renderContent(f.value ?? '', env)
+    tr.push(name, raw)
     // 字段值有换行：换行后缩进两个空格
-    const value = renderContent(f.value ?? '', env).replace(/\n/g, '\n  ')
+    const value = raw.replace(/\n/g, '\n  ')
     if (name || value) lines.push(`${name}：${value}`)
   }
   const footer: string[] = []
@@ -209,12 +214,16 @@ function renderEmbed(e: RawEmbed, env: ContentEnv, media: Media[]): string | nul
 }
 
 /** 组件消息（R13）：递归找 TextDisplay 文字和图片；返回文字行。 */
-function walkComponents(list: RawComponent[] | undefined, env: ContentEnv, media: Media[], out: string[]) {
+function walkComponents(list: RawComponent[] | undefined, env: ContentEnv, media: Media[], out: string[], tr: string[]) {
   for (const c of list ?? []) {
     if (!c || typeof c !== 'object') continue
     switch (c.type) {
       case 10:
-        if (c.content) out.push(renderContent(c.content, env))
+        if (c.content) {
+          const t = renderContent(c.content, env)
+          out.push(t)
+          tr.push(t)
+        }
         break
       case 11:
         if (c.media) media.push(imageMedia(mediaUrls(c.media)))
@@ -228,8 +237,8 @@ function walkComponents(list: RawComponent[] | undefined, env: ContentEnv, media
         out.push('[文件]')
         break
     }
-    if (c.components) walkComponents(c.components, env, media, out)
-    if (c.accessory) walkComponents([c.accessory], env, media, out)
+    if (c.components) walkComponents(c.components, env, media, out, tr)
+    if (c.accessory) walkComponents([c.accessory], env, media, out, tr)
   }
 }
 
@@ -331,16 +340,16 @@ export function collectRefs(d: RawMessage): { roles: string[]; channels: string[
 }
 
 /** 渲染一条消息的 embed 和组件，返回文字块。 */
-function renderRich(m: RawSnapshotMessage, env: ContentEnv, media: Media[], hasOther: boolean): string[] {
+function renderRich(m: RawSnapshotMessage, env: ContentEnv, media: Media[], hasOther: boolean, tr: string[]): string[] {
   const blocks: string[] = []
   for (const e of m.embeds ?? []) {
-    const b = renderEmbed(e, env, media)
+    const b = renderEmbed(e, env, media, tr)
     if (b) blocks.push(b)
   }
   if (m.components?.length) {
     const lines: string[] = []
     const before = media.length
-    walkComponents(m.components, env, media, lines)
+    walkComponents(m.components, env, media, lines, tr)
     const text = lines.filter((l) => l.trim() !== '').join('\n')
     if (text) blocks.push(text)
     // 组件里什么都没取到：V2 组件消息、或者消息本身没有别的内容时，写 `[组件消息]`；普通消息下面挂的按钮不提示
@@ -352,13 +361,19 @@ function renderRich(m: RawSnapshotMessage, env: ContentEnv, media: Media[], hasO
 /** Discord 原始消息 → Msg。不转发的类型、渲染后全空的消息返回 null。 */
 export function renderDiscordMessage(d: RawMessage, opts: RenderOptions): Msg | null {
   if (!FORWARDED_TYPES.has(d.type ?? 0)) return null
-  const env = envFor(d.mentions, opts)
+  // 翻译输入的片段、渲染出的受保护记号（回复不收集）
+  const tr: string[] = []
+  const tokens: string[] = []
+  const onToken = (s: string) => { tokens.push(s) }
+  const env = envFor(d.mentions, opts, true, onToken)
   const media: Media[] = []
   const blocks: string[] = []
   const tail: string[] = []
   const names: string[] = []
 
   let body = renderContent(d.content ?? '', env)
+  // 投票行不进翻译输入
+  tr.push(body)
   if (d.poll) {
     const line = `[投票] ${d.poll.question?.text ?? ''}`.trimEnd()
     body = body.trim() ? `${body}\n${line}` : line
@@ -368,22 +383,23 @@ export function renderDiscordMessage(d: RawMessage, opts: RenderOptions): Msg | 
   renderStickers(d.sticker_items, media, tail)
   const hasOther = body.trim() !== '' || media.length > 0 || tail.length > 0
     || (d.embeds ?? []).some((e) => !e.type || e.type === 'rich')
-  blocks.push(...renderRich(d, env, media, hasOther))
+  blocks.push(...renderRich(d, env, media, hasOther, tr))
 
   // 转发的消息：`[转发的消息]` 开头，快照没有作者；不做回复查找
   if (d.message_reference?.type === 1) {
     for (const s of d.message_snapshots?.length ? d.message_snapshots : [{}]) {
       const m = s.message ?? {}
-      const senv = envFor(m.mentions, opts, false)
+      const senv = envFor(m.mentions, opts, false, onToken)
       const parts: string[] = ['[转发的消息]']
       const content = renderContent(m.content ?? '', senv)
+      tr.push(content)
       if (content.trim()) parts.push(content)
       const lines: string[] = []
       renderAttachments(m.attachments, media, lines, names)
       renderStickers(m.sticker_items, media, lines)
       const other = !!content.trim() || lines.length > 0 || !!m.attachments?.length || !!m.sticker_items?.length
         || (m.embeds ?? []).some((e) => !e.type || e.type === 'rich')
-      const rich = renderRich(m, senv, media, other)
+      const rich = renderRich(m, senv, media, other, tr)
       const head = parts.join('\n')
       blocks.push([head, ...rich, ...(lines.length ? [lines.join('\n')] : [])].join('\n\n'))
     }
@@ -407,6 +423,10 @@ export function renderDiscordMessage(d: RawMessage, opts: RenderOptions): Msg | 
     }
   }
 
+  const translatable = tr.map((t) => t.trim()).filter(Boolean).join('\n\n')
+  // 去重，只留真的出现在翻译输入里的
+  const protect = [...new Set(tokens)].filter((t) => t !== '' && translatable.includes(t))
+
   const ts = d.timestamp ? Date.parse(d.timestamp) : NaN
   return {
     platform: 'discord',
@@ -424,5 +444,7 @@ export function renderDiscordMessage(d: RawMessage, opts: RenderOptions): Msg | 
     timestamp: Number.isNaN(ts) ? opts.now : ts,
     backfill: opts.backfill === true,
     checkText: [body, ...blocks, ...names].filter((s) => s !== '').join('\n'),
+    translatable,
+    protect,
   }
 }

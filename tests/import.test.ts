@@ -60,7 +60,7 @@ const reasonOf = (what: string) => r.skipped.filter(s => s.what.includes(what)).
 describe('convertOldConfig', () => {
   it('merges both directions into one both row with QQ-side blockingWords', () => {
     expect(find(D1, Q1)).toEqual({
-      label: 'Alpha', discord: D1, qq: Q1, direction: 'both', enabled: true, atAll: false, blockWords: '广告;;SPAM',
+      label: 'Alpha', discord: D1, qq: Q1, direction: 'both', enabled: true, atAll: false, translate: false, blockWords: '广告;;SPAM',
     })
   })
 

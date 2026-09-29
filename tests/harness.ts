@@ -240,8 +240,15 @@ export interface Env {
   stop(): Promise<void>
 }
 
+/** PR 2 新增的配置项的默认值（全部关闭）。 */
+export const PR2_DEFAULTS: Pick<Config, 'translate' | 'filter' | 'glossary'> = {
+  translate: { enabled: false, baseURL: '', apiKey: '', model: '', label: '【机翻】', timeoutMs: 6000, maxPerHour: 0 },
+  filter: { keywords: '', keywordFile: '', moderation: false, moderationBaseURL: 'https://api.openai.com/v1', moderationApiKey: '' },
+  glossary: { eve: false, systemStyle: 'en(zh)', slangFile: '', overrides: [] },
+}
+
 export function bridge(row: Partial<BridgeRow> = {}): BridgeRow {
-  return { label: '测试桥', discord: DC_CHANNEL, qq: QQ_GROUP, direction: 'both', enabled: true, atAll: false, blockWords: '', ...row }
+  return { label: '测试桥', discord: DC_CHANNEL, qq: QQ_GROUP, direction: 'both', enabled: true, atAll: false, blockWords: '', translate: false, ...row }
 }
 
 let snowflake = 960000000000000000n
@@ -302,6 +309,7 @@ export async function setup(patch: Partial<Config> = {}, options: { online?: boo
     qqReorderMs: 0,
     bridges: [bridge()],
     atAll: { fallbackText: '【全体通知】', reserve: 0, dailyCap: 0, cooldownMinutes: 0, maxAgeMinutes: 10 },
+    ...PR2_DEFAULTS,
     ...patch,
   }
 

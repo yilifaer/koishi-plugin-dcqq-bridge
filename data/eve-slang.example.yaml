@@ -1,0 +1,51 @@
+# EVE 黑话表示例（glossary.slangFile 指向这种格式的文件）
+# 下面几条都是编造的示例，只用来说明格式，请按自己的需要改写。
+#
+# 每一条的字段：
+#   en          英文标准写法。中译英的 force 输出它；hint 行里写在左边
+#   zh          中文标准写法。英译中的 force 输出它；hint 行里写在右边
+#   mode        keep  = 原样保留来源里的写法，不让模型改
+#               force = 一定换成另一种语言的标准写法（en ↔ zh）
+#               hint  = 不替换，只作为「术语参考」交给模型
+#   dir         both = 两个方向都用；en2zh = 只在英译中时用；zh2en = 只在中译英时用
+#   en_aliases  英文的其他写法（可选），只用于在原文里查找，输出仍然是 en / zh
+#   zh_aliases  中文的其他写法（可选），同上
+#   category / note / confidence  只给人看，插件运行时忽略
+#
+# 匹配规则：最长优先；英文前后要是词边界，允许末尾多一个 s；
+# 英文字母不超过 3 个的写法（例如 FC、o7）只在大小写完全一致时匹配；
+# 少于 2 个字的词条或别名会被丢弃并警告。
+
+- en: "ping"
+  zh: "集结通知"
+  mode: hint
+  dir: en2zh
+  en_aliases: ["fleet ping"]
+  category: fleet
+  note: "示例：只给模型参考，不替换"
+
+- en: "FC"
+  zh: "指挥"
+  mode: force
+  dir: both
+  en_aliases: ["fleet commander"]
+  zh_aliases: ["舰队指挥"]
+  category: fleet
+  note: "示例：FC 只匹配大写；fc 不算"
+  confidence: high
+
+- en: "o7"
+  zh: "o7"
+  mode: keep
+  dir: both
+  en_aliases: ["o/"]
+  category: chat
+  note: "示例：敬礼，两边都原样保留"
+
+- en: "burn home"
+  zh: "回家"
+  mode: force
+  dir: en2zh
+  en_aliases: ["burn back home"]
+  category: fleet
+  note: "示例：只在英译中时替换"

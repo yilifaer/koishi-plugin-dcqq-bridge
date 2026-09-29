@@ -62,6 +62,13 @@ export interface Msg {
   checkText: string
   /** QQ 来源：原始数据里的 message_seq（有的话），给重排用。 */
   seq?: number
+  /**
+   * 翻译输入（清单 §6.4）：正文 + embed 的标题、描述、字段名和字段值。
+   * 不含前缀、embed 作者和页脚、附件和贴纸的占位文字、文件名、回复引用行。
+   */
+  translatable?: string
+  /** 翻译时要原样保护的文字：提及、频道、表情渲染后的文字、换算后的时间等（清单 §12.1 第 2 步）。 */
+  protect?: string[]
 }
 
 /** 正文和文字块拼起来的完整文字（不含前缀、回复引用行）。 */

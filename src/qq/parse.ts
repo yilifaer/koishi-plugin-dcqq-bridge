@@ -97,22 +97,39 @@ function cardTitle(data: unknown): string {
 const str = (v: unknown) => (v == null ? '' : String(v))
 const src = (attrs: Record<string, any>) => str(attrs.src || attrs.url)
 
+export interface RenderedQQ {
+  text: string
+  media: Media[]
+  /** 翻译输入：文字、@、表情、markdown；不含图片、语音、文件、转发、卡片等占位（清单 §6.4）。 */
+  translatable: string
+  /** 渲染出的 @ 和表情文字，去重（清单 §12.1 第 2 步）。 */
+  protect: string[]
+}
+
 /** 按 §8.1 的表把 QQ 元素渲染成纯文本 + 媒体。 */
-export function renderQQElements(elements: Element[], env: RenderEnv): { text: string; media: Media[] } {
+export function renderQQElements(elements: Element[], env: RenderEnv): RenderedQQ {
   let text = ''
+  let tr = ''
+  const tokens: string[] = []
   const media: Media[] = []
+  // 可翻译的文字；token 为真时同时记为受保护
+  const add = (s: string, token = false) => {
+    text += s
+    tr += s
+    if (token && s) tokens.push(s)
+  }
   for (const el of elements) {
     const a = el.attrs
     switch (el.type) {
       case 'text':
-        text += str(a.content)
+        add(str(a.content))
         break
       case 'at':
-        if (a.type === 'all') text += '@全体成员'
-        else text += '@' + (str(a.name) || env.memberName(str(a.id)) || str(a.id))
+        if (a.type === 'all') add('@全体成员', true)
+        else add('@' + (str(a.name) || env.memberName(str(a.id)) || str(a.id)), true)
         break
       case 'face':
-        text += a.name ? `[${a.name}]` : '[表情]'
+        add(a.name ? `[${a.name}]` : '[表情]', true)
         break
       case 'mface': {
         text += '[表情包]'
@@ -156,8 +173,7 @@ export function renderQQElements(elements: Element[], env: RenderEnv): { text: s
         break
       }
       case 'markdown': {
-        const content = str(a.content) || str(parseJson(a.data)?.content)
-        text += content
+        add(str(a.content) || str(parseJson(a.data)?.content))
         break
       }
       case 'reply':
@@ -167,7 +183,9 @@ export function renderQQElements(elements: Element[], env: RenderEnv): { text: s
         text += `[${el.type}]`
     }
   }
-  return { text, media }
+  const translatable = tr.trim()
+  const protect = [...new Set(tokens)].filter((t) => translatable.includes(t))
+  return { text, media, translatable, protect }
 }
 
 function fileNames(elements: Element[]): string[] {
@@ -211,7 +229,7 @@ export function parseQQMessage(session: QQSessionLike, env: ParseEnv): Msg {
     }
   }
 
-  const { text, media } = renderQQElements(elements, env)
+  const { text, media, translatable, protect } = renderQQElements(elements, env)
   const userId = str(session.userId)
   const author =
     session.event.member?.nick ||
@@ -239,6 +257,8 @@ export function parseQQMessage(session: QQSessionLike, env: ParseEnv): Msg {
     timestamp: session.timestamp || env.now,
     backfill: false,
     checkText: [text, ...names].filter(Boolean).join('\n'),
+    translatable,
+    protect,
     seq: raw?.message_seq != null && raw.message_seq !== '' && Number.isFinite(seq) ? seq : undefined,
   }
 }

@@ -7,6 +7,8 @@ export interface BridgeStats {
   forwards: number[]
   failures: number[]
   lastFailure: { reason: string; at: number } | null
+  translated: number[]
+  translateFailures: number[]
 }
 
 export class Stats {
@@ -18,7 +20,7 @@ export class Stats {
 
   private entry(key: string) {
     let stats = this.map.get(key)
-    if (!stats) this.map.set(key, stats = { lastForwardAt: 0, forwards: [], failures: [], lastFailure: null })
+    if (!stats) this.map.set(key, stats = { lastForwardAt: 0, forwards: [], failures: [], lastFailure: null, translated: [], translateFailures: [] })
     return stats
   }
 
@@ -41,11 +43,29 @@ export class Stats {
     this.prune(stats.failures)
   }
 
+  /** 翻译结果（跳过的不算）。 */
+  translation(key: string, ok: boolean, reason?: string) {
+    const stats = this.entry(key)
+    ;(ok ? stats.translated : stats.translateFailures).push(this.now())
+    if (!ok && reason) this.lastTranslateFailure.set(key, { reason, at: this.now() })
+    this.prune(stats.translated)
+    this.prune(stats.translateFailures)
+  }
+
+  lastTranslateFailure = new Map<string, { reason: string; at: number }>()
+
   get(key: string) {
     const stats = this.entry(key)
-    this.prune(stats.forwards)
-    this.prune(stats.failures)
-    return { lastForwardAt: stats.lastForwardAt, forwards: stats.forwards.length, failures: stats.failures.length, lastFailure: stats.lastFailure }
+    for (const list of [stats.forwards, stats.failures, stats.translated, stats.translateFailures]) this.prune(list)
+    return {
+      lastForwardAt: stats.lastForwardAt,
+      forwards: stats.forwards.length,
+      failures: stats.failures.length,
+      lastFailure: stats.lastFailure,
+      translated: stats.translated.length,
+      translateFailures: stats.translateFailures.length,
+      lastTranslateFailure: this.lastTranslateFailure.get(key) ?? null,
+    }
   }
 
   atAllFallback(groupId: string, date: string, reason: string) {

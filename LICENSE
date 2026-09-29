@@ -19,3 +19,24 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---------------------------------------------------------------------------
+
+Exception for bundled data / 数据文件例外
+
+The MIT License above applies to the source code of this project only. It does
+NOT apply to the following data files:
+
+- data/eve-glossary.json is derived from CCP hf.'s EVE Online static data and is
+  used under the EVE Developer License Agreement
+  (https://developers.eveonline.com/license-agreement), which permits
+  non-commercial, non-profit use only.
+  © 2014 CCP hf. All rights reserved. "EVE", "EVE Online", "CCP", and all related logos and images are trademarks or registered trademarks of CCP hf.
+- data/common-words.txt is derived from SCOWL (Kevin Atkinson) and is under the
+  SCOWL license.
+
+See data/NOTICE for details and the full notices.
+
+上面的 MIT 许可只适用于本项目的代码。data/eve-glossary.json 来自 CCP 的游戏数据，按
+EVE 开发者许可协议使用；data/common-words.txt 来自 SCOWL，按 SCOWL 的许可使用。
+详见 data/NOTICE。

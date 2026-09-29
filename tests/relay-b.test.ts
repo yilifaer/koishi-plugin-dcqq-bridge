@@ -12,8 +12,7 @@ import type { Config } from '../src/config'
 import { describeError, redact } from '../src/log'
 import { Relay } from '../src/relay'
 import {
-  bridge, DC_BOT, DC_CHANNEL, DC_CHANNEL2, DC_GUILD, discordPayload, Env, OWNER_QQ, QQ_BOT, QQ_GROUP, QQ_GROUP2, QQ_USER, qqPayload, setup, sleep,
-} from './harness'
+  bridge, DC_BOT, DC_CHANNEL, DC_CHANNEL2, DC_GUILD, discordPayload, Env, OWNER_QQ, QQ_BOT, QQ_GROUP, QQ_GROUP2, QQ_USER, qqPayload, setup, sleep, PR2_DEFAULTS } from './harness'
 
 const ZW = '​'
 
@@ -117,6 +116,7 @@ function baseConfig(patch: Partial<Config> = {}): Config {
     qqReorderMs: 0,
     bridges: [bridge()],
     atAll: { fallbackText: '【全体通知】', reserve: 0, dailyCap: 0, cooldownMinutes: 0, maxAgeMinutes: 10 },
+    ...PR2_DEFAULTS,
     ...patch,
   }
 }

@@ -60,6 +60,15 @@ export async function statusText(relay: Relay, filter: (b: { discord: string; qq
   const time = timeFormatter(settings.timeZone)
   if (relay.paused.has('global')) lines.push('⏸ 全局暂停中')
   for (const problem of settings.problems) lines.push(`⚠ ${problem}`)
+  if (relay.pausedTr.has('global')) lines.push('⏸ 翻译全局暂停中')
+  for (const problem of relay.translation.problems.slice(0, 10)) lines.push(`⚠ ${problem}`)
+  if (settings.translate.enabled) {
+    const t = relay.translation.translator.stats()
+    const reasons = Object.entries(t.failures).map(([r, n]) => `${r} ${n}`).join('、')
+    lines.push(`翻译：请求 ${t.requests} 次，用量 ${t.promptTokens + t.completionTokens} tokens${reasons ? `，请求失败：${reasons}` : ''}`)
+    const outcomes = [...relay.translation.outcomes].filter(([r]) => r !== '成功').map(([r, n]) => `${r} ${n}`).join('、')
+    if (outcomes) lines.push(`   没附译文的原因：${outcomes}`)
+  }
   for (const platform of ['discord', 'onebot'] as const) {
     const problem = relay.botProblem(platform)
     if (problem) lines.push(`⚠ ${problem}`)
@@ -86,6 +95,11 @@ export async function statusText(relay: Relay, filter: (b: { discord: string; qq
     const parts = [`${head} ${state}`, `最近转发 ${time(stats.lastForwardAt)}`, `24 小时 ${stats.forwards} 条 / 失败 ${stats.failures}`]
     lines.push(parts.join('，'))
     if (stats.lastFailure) lines.push(`   最近一次失败：${stats.lastFailure.reason}（${time(stats.lastFailure.at)}）`)
+    if (bridge.translate && settings.translate.enabled) {
+      const paused = relay.isTranslationPaused(bridge) ? '（翻译暂停中）' : ''
+      const last = stats.lastTranslateFailure ? `，最近一次失败：${stats.lastTranslateFailure.reason}` : ''
+      lines.push(`   翻译${paused}：24 小时 ${stats.translated} 条 / 失败 ${stats.translateFailures}${last}`)
+    }
     for (const problem of relay.health.get(bridge.key) ?? []) lines.push(`   ${problem.startsWith('⚠') ? problem : `⚠ ${problem}`}`)
     for (const warning of row.warnings) lines.push(`   ⚠ ${warning}`)
     if (bridge.atAll) {
@@ -125,17 +139,20 @@ export function registerCommands(ctx: Context, relay: Relay) {
       await reply(session, await statusText(relay, filter, all))
     })
 
-  const pauseAction = (paused: boolean) => async ({ session }: { session?: Session }, target?: string) => {
+  const pauseAction = (paused: boolean) => async ({ session, options }: { session?: Session; options?: { translate?: boolean } }, target?: string) => {
     if (!session) return
+    // -t：只暂停或恢复翻译（清单 §13），转发照常
+    const tr = !!options?.translate
+    const what = tr ? '翻译' : '转发'
     try {
       if (!target) {
-        await relay.setPaused('global', paused)
-        return void reply(session, paused ? '已全局暂停，所有转发停止。' : '已恢复全局转发。')
+        await relay.setPaused('global', paused, tr)
+        return void reply(session, paused ? `已全局暂停${what}。` : `已恢复全局${what}。`)
       }
       const found = findBridges(relay, target)
       if (found.error) return void reply(session, found.error)
-      for (const key of new Set(found.bridges.map((b) => b.key))) await relay.setPaused(key, paused)
-      await reply(session, `${paused ? '已暂停' : '已恢复'}：${found.bridges.map((b) => `${b.index}. ${b.label || b.key}`).join('、')}`)
+      for (const key of new Set(found.bridges.map((b) => b.key))) await relay.setPaused(key, paused, tr)
+      await reply(session, `${paused ? '已暂停' : '已恢复'}${what}：${found.bridges.map((b) => `${b.index}. ${b.label || b.key}`).join('、')}`)
     } catch (e) {
       await reply(session, `操作失败：${describeError(e)}`)
     }
@@ -143,11 +160,29 @@ export function registerCommands(ctx: Context, relay: Relay) {
 
   ctx.command('bridge.pause [target:string]', '暂停转发（不带参数 = 全局暂停）', { authority })
     .alias('桥接暂停')
+    .option('translate', '-t 只暂停翻译')
     .action(pauseAction(true))
 
   ctx.command('bridge.resume [target:string]', '恢复转发', { authority })
     .alias('桥接恢复')
+    .option('translate', '-t 只恢复翻译')
     .action(pauseAction(false))
+
+  ctx.command('bridge.reload', '重新读取关键词文件和黑话表', { authority })
+    .action(async ({ session }) => {
+      if (!session) return
+      try {
+        await relay.translation.reload()
+        const glossary = relay.translation.glossary
+        const problems = relay.translation.problems
+        await reply(session, [
+          `已重新读取。关键词 ${relay.translation.keywords?.size ?? 0} 条，术语 ${glossary?.size ?? 0} 条。`,
+          ...(problems.length ? ['问题：', ...problems.slice(0, 30).map((p) => `⚠ ${p}`)] : []),
+        ].join('\n'))
+      } catch (e) {
+        await reply(session, `重新读取失败：${describeError(e)}`)
+      }
+    })
 
   ctx.command('bridge.import', '从 @myrtus/forward 的配置生成桥（只输出，不改配置）', { authority })
     .action(async ({ session }) => {

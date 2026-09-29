@@ -1,11 +1,12 @@
 {
   "name": "koishi-plugin-dcqq-bridge",
-  "version": "0.1.0",
-  "description": "Discord 频道与 QQ 群（OneBot）之间的消息转发：完整渲染 embed、换算时间码、@全体、防 ping、失败降级",
+  "version": "0.2.0",
+  "description": "Discord 频道与 QQ 群（OneBot）之间的消息转发：完整渲染 embed、换算时间码、@全体、防 ping、失败降级、可选的机器翻译与 EVE 术语表",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [
     "lib",
+    "data",
     "README.md",
     "LICENSE"
   ],
@@ -36,6 +37,7 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
+    "build:glossary": "node scripts/build-eve-glossary.mjs",
     "prepublishOnly": "npm run typecheck && npm test && npm run build"
   },
   "peerDependencies": {
@@ -58,11 +60,16 @@
     "@satorijs/adapter-discord": "4.6.2",
     "@types/js-yaml": "^4.0.9",
     "@types/node": "^22.20.4",
+    "@types/yauzl": "^3.4.0",
+    "@types/yazl": "^3.3.1",
     "koishi": "4.18.11",
     "koishi-plugin-adapter-onebot": "6.9.4",
     "typescript": "^5.9.3",
     "vite": "^6.4.3",
-    "vitest": "^3.2.7"
+    "vitest": "^3.2.7",
+    "wordlist-english": "^1.2.1",
+    "yauzl": "^3.4.0",
+    "yazl": "^3.3.1"
   },
   "dependencies": {
     "js-yaml": "^4.3.2"

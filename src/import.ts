@@ -221,7 +221,7 @@ export function convertOldConfig(oldConfig: any): ImportResult {
     }
     if (words.length) anyWords = true
     const direction: Direction = p.d2q && p.q2d ? 'both' : p.d2q ? 'd2q' : 'q2d'
-    bridges.push({ label: makeLabel(p), discord: p.discord, qq: p.qq, direction, enabled: true, atAll: false, blockWords: words.join(';;') })
+    bridges.push({ label: makeLabel(p), discord: p.discord, qq: p.qq, direction, enabled: true, atAll: false, translate: false, blockWords: words.join(';;') })
   }
 
   if (anyWords) {
@@ -275,6 +275,7 @@ export function bridgesToYaml(bridges: BridgeRow[]): string {
     enabled: b.enabled,
     atAll: b.atAll,
     blockWords: b.blockWords,
+    translate: b.translate,
   }))
   return yaml.dump({ bridges: rows }, { forceQuotes: true, lineWidth: -1, noRefs: true })
 }
