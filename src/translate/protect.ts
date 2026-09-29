@@ -10,7 +10,8 @@ const ANY_TOKEN = /⟦[^⟦⟧\n]*⟧/g
 
 // 原文里本来就有的 ⟦…⟧ 或单个 ⟦、⟧：也保护起来，免得和占位符混淆
 const LITERAL = /⟦[^⟦⟧\n]*⟧|[⟦⟧]/g
-const URL_RE = /\bhttps?:\/\/[^\s<>⟦⟧]+/gi
+// 网址遇到第一个非 ASCII 字符（例如紧跟的中文）就结束（B5）
+const URL_RE = /\bhttps?:\/\/[\x21-\x3b\x3d\x3f-\x7e]+/gi
 // 代号星系、虫洞星系、ISK 数字（清单 §12.1）
 const PATTERNS = [
   /\b[A-Z0-9]{1,5}-[A-Z0-9]{1,5}\b/g,

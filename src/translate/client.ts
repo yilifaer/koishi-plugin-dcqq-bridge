@@ -7,7 +7,12 @@ export interface TranslatorConfig {
   model: string
   timeoutMs: number
   maxPerHour: number
+  /** 额外合并进请求体的字段（已解析好的对象，B7）；不能覆盖 model、messages。 */
+  extraBody?: Record<string, unknown>
 }
+
+/** 同时进行的翻译请求最多几个（B4）；排队的仍受 timeoutMs 限制（从提交时算）。 */
+export const MAX_CONCURRENT = 4
 
 export type TranslateResult =
   | { ok: true; text: string; promptTokens?: number; completionTokens?: number }
@@ -31,6 +36,8 @@ const SYSTEM: Record<TranslateInput['direction'], string> = {
 
 // 只认针对翻译任务本身的拒绝，不用「抱歉」「I can't」这类普通说法
 const REFUSALS = ['无法翻译', '作为AI', '作为一个AI', "I can't translate", 'I cannot translate', "I can't help with", 'As an AI']
+// 原文里有这类说法时不做拒绝判断（B6）：「这个我帮不上忙」→「I can't help with this」是正常译文
+const SOURCE_REFUSALS = ['帮不', '无法翻译', '不能翻译', '翻译不了', '作为AI', '作为一个AI', 'as an ai', "can't help", 'cannot help', "can't translate", 'cannot translate']
 
 const ANY_TOKEN = /⟦[^⟦⟧\n]*⟧/g
 const HAN = /\p{Script=Han}/gu
@@ -43,16 +50,21 @@ function normalizeForRefusal(text: string) {
     .replace(/\s+(?=\p{Script=Han})|(?<=\p{Script=Han})\s+/gu, '')
 }
 
-const REFUSAL_RES = REFUSALS.map((phrase) => {
-  const p = normalizeForRefusal(phrase).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  // 英文短语按整词匹配（「has an aim」不算「as an ai」）
-  return new RegExp(`${/^[a-z]/.test(p) ? '\\b' : ''}${p}${/[a-z]$/.test(p) ? '\\b' : ''}`)
-})
+function phraseRes(list: string[]) {
+  return list.map((phrase) => {
+    const p = normalizeForRefusal(phrase).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    // 英文短语按整词匹配（「has an aim」不算「as an ai」）
+    return new RegExp(`${/^[a-z]/.test(p) ? '\\b' : ''}${p}${/[a-z]$/.test(p) ? '\\b' : ''}`)
+  })
+}
+const REFUSAL_RES = phraseRes(REFUSALS)
+const SOURCE_REFUSAL_RES = phraseRes(SOURCE_REFUSALS)
 
-function refused(translated: string, source: string) {
+function refused(translated: string, sources: string[]) {
+  const src = sources.map((s) => normalizeForRefusal(s.replace(ANY_TOKEN, ' ')))
+  if (SOURCE_REFUSAL_RES.some((re) => src.some((s) => re.test(s)))) return false
   const out = normalizeForRefusal(translated)
-  const src = normalizeForRefusal(source)
-  return REFUSAL_RES.some((re) => re.test(out) && !re.test(src))
+  return REFUSAL_RES.some((re) => re.test(out) && !src.some((s) => re.test(s)))
 }
 
 function charCount(text: string) {
@@ -109,6 +121,8 @@ type Attempt =
 
 export class Translator {
   private sent: number[] = []
+  private active = 0
+  private waiters: Array<() => void> = []
   private counters = { requests: 0, failures: {} as Record<string, number>, promptTokens: 0, completionTokens: 0 }
 
   constructor(private http: any, private getConfig: () => TranslatorConfig, private now: () => number = Date.now) {}
@@ -131,6 +145,37 @@ export class Translator {
     return true
   }
 
+  /** 占一个并发名额；到 deadline 还没轮到就返回 false（不发请求）。 */
+  private acquire(deadline: number): Promise<boolean> {
+    if (this.active < MAX_CONCURRENT) {
+      this.active++
+      return Promise.resolve(true)
+    }
+    return new Promise((resolve) => {
+      const wake = () => {
+        clearTimeout(timer)
+        this.active++
+        resolve(true)
+      }
+      const timer = setTimeout(() => {
+        const i = this.waiters.indexOf(wake)
+        if (i >= 0) this.waiters.splice(i, 1)
+        resolve(false)
+      }, Math.max(0, deadline - Date.now()))
+      this.waiters.push(wake)
+    })
+  }
+
+  private release() {
+    this.active--
+    this.waiters.shift()?.()
+  }
+
+  /** 正在进行和排队的请求数（测试、状态用）。 */
+  load() {
+    return { active: this.active, queued: this.waiters.length }
+  }
+
   private async attempt(url: string, headers: Record<string, string>, body: any, timeout: number): Promise<Attempt> {
     try {
       const data = await this.http.post(url, body, { headers, timeout })
@@ -149,6 +194,20 @@ export class Translator {
 
   async translate(input: TranslateInput): Promise<TranslateResult> {
     const config = this.getConfig()
+    const timeoutMs = Math.max(1, Number(config.timeoutMs) || 6000)
+    // 超时从提交时算：排队等不到名额的直接按超时，不发请求
+    const deadline = Date.now() + timeoutMs
+    if (!await this.acquire(deadline)) return this.fail('超时')
+    try {
+      return await this.send(input, config, deadline)
+    } finally {
+      this.release()
+    }
+  }
+
+  private async send(input: TranslateInput, config: TranslatorConfig, deadline: number): Promise<TranslateResult> {
+    const left0 = deadline - Date.now()
+    if (left0 <= 0) return this.fail('超时')
     if (!this.takeQuota(Math.max(0, Number(config.maxPerHour) || 0))) return this.fail('超过每小时上限')
     this.counters.requests++
 
@@ -158,6 +217,7 @@ export class Translator {
     const hints = input.hints.slice(0, 30)
     const user = (hints.length ? `术语参考：\n${hints.join('\n')}\n\n` : '') + `<text>${input.text}</text>`
     const body = {
+      ...(config.extraBody ?? {}),
       model: config.model,
       messages: [
         { role: 'system', content: SYSTEM[input.direction] },
@@ -165,9 +225,7 @@ export class Translator {
       ],
     }
 
-    const timeoutMs = Math.max(1, Number(config.timeoutMs) || 6000)
-    const deadline = Date.now() + timeoutMs
-    let result = await this.attempt(url, headers, body, timeoutMs)
+    let result = await this.attempt(url, headers, body, left0)
     if (result.kind === 'retry') {
       const waitMs = result.waitMs
       const left = deadline - Date.now() - waitMs
@@ -190,7 +248,7 @@ export class Translator {
     if (!text) return this.fail('空结果')
     if (!placeholdersMatch(input.text, text, input.tokens)) return this.fail('占位符不符')
     if (!lengthOk(text, input.sourceForChecks, input.direction)) return this.fail('长度异常')
-    if (refused(text, input.sourceForChecks)) return this.fail('拒绝翻译')
+    if (refused(text, [input.sourceForChecks, input.text])) return this.fail('拒绝翻译')
     return { ok: true, text, ...usage }
   }
 }

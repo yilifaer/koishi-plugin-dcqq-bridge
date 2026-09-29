@@ -44,6 +44,10 @@ export interface TranslateSettings {
   label: string
   timeoutMs: number
   maxPerHour: number
+  /** 解析好的额外请求体字段（去掉了 model、messages）；没填或写错时为空对象。 */
+  extraBody: Record<string, unknown>
+  /** 不算命令的词（小写）。 */
+  notCommands: string[]
 }
 
 export interface FilterSettings {
@@ -115,6 +119,25 @@ export function compileBlockWords(source: string): { patterns: RegExp[]; errors:
   return { patterns, errors }
 }
 
+/** translate.extraBody：必须是 JSON 对象；写错时提示并忽略（B7）。不把内容写进提示（可能带 key）。 */
+function parseExtraBody(source: string, problems: string[]): Record<string, unknown> {
+  if (!source.trim()) return {}
+  let value: unknown
+  try {
+    value = JSON.parse(source)
+  } catch {
+    problems.push('翻译的 extraBody 不是有效的 JSON，已忽略')
+    return {}
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    problems.push('翻译的 extraBody 必须是 JSON 对象（{ … }），已忽略')
+    return {}
+  }
+  const out: Record<string, unknown> = {}
+  for (const [k, v] of Object.entries(value)) if (k !== 'model' && k !== 'messages' && k !== '__proto__') out[k] = v
+  return out
+}
+
 export function normalizeSettings(config: Partial<Config>): Settings {
   const problems: string[] = []
   let timeZone = isValidTimeZone(text(config.timezone, 'Asia/Shanghai').trim() || 'Asia/Shanghai')
@@ -140,6 +163,8 @@ export function normalizeSettings(config: Partial<Config>): Settings {
     label,
     timeoutMs: clampInt(tr.timeoutMs, 6000, 1000, 60000),
     maxPerHour: clampInt(tr.maxPerHour, 0, 0, 1000000),
+    extraBody: parseExtraBody(text(tr.extraBody), problems),
+    notCommands: [...new Set(text(tr.notCommands, 'help').split(';;').map((w) => w.trim().toLowerCase()).filter(Boolean))],
   }
   if (translate.enabled && (!translate.baseURL || !translate.model)) {
     problems.push('翻译已打开，但没有填接口地址或模型，按关闭处理')

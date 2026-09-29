@@ -21,6 +21,12 @@ export type TranslationOutcome =
 
 const CACHE_SIZE = 1000
 const CACHE_TTL = 24 * 3600 * 1000
+const HAN_OR_LETTER = /\p{L}/u
+
+/** 比较用：去首尾空白、连续空白合成一个、不区分大小写（B3）。 */
+function normalizeForCompare(text: string) {
+  return text.trim().replace(/\s+/g, ' ').toLowerCase()
+}
 
 export class TranslationService {
   glossary: Glossary | null = null
@@ -31,7 +37,8 @@ export class TranslationService {
   outcomes = new Map<string, number>()
   translator: Translator
   moderator: Moderator
-  private cache = new Map<string, { text: string; at: number }>()
+  /** text 为 null：译文和原文相同，不附（B3）。 */
+  private cache = new Map<string, { text: string | null; at: number }>()
   private markReady: () => void = () => {}
   private ready: Promise<void> = new Promise((resolve) => (this.markReady = resolve))
   private warnedHourCap = 0
@@ -44,7 +51,7 @@ export class TranslationService {
   ) {
     this.translator = new Translator(ctx.http, () => {
       const t = this.getSettings().translate
-      return { baseURL: t.baseURL, apiKey: t.apiKey, model: t.model, timeoutMs: t.timeoutMs, maxPerHour: t.maxPerHour }
+      return { baseURL: t.baseURL, apiKey: t.apiKey, model: t.model, timeoutMs: t.timeoutMs, maxPerHour: t.maxPerHour, extraBody: t.extraBody }
     }, now)
     this.moderator = new Moderator(ctx.http, () => {
       const s = this.getSettings()
@@ -149,7 +156,8 @@ export class TranslationService {
     const source = (msg.translatable ?? '').trim()
     if (!source) return this.skip('没有可翻译的文字')
     if (this.keywords?.matches(source)) return this.skip('关键词命中原文')
-    if (isCommand(source, this.prefixes(), (word) => this.ctx.$commander.resolve(word))) return this.skip('命令')
+    const notCommands = this.getSettings().translate.notCommands
+    if (isCommand(source, this.prefixes(), (word) => this.ctx.$commander.resolve(word), notCommands)) return this.skip('命令')
     const guarded = protect(source, msg.protect ?? [])
     const applied = this.glossary?.apply(guarded.text, direction) ?? { text: guarded.text, tokens: [], hints: [] }
     const stripped = stripTokens(applied.text)
@@ -158,12 +166,19 @@ export class TranslationService {
     if (skip) return this.skip(skip)
 
     if (this.moderationKeyMissing()) return this.skip('审核未配置密钥')
+    // B3：去掉所有占位符（保护 + 术语）后没有文字 → 不请求服务商；术语换完后和原文不同就本地生成译文
+    if (!HAN_OR_LETTER.test(stripped)) {
+      const local = restore(restore(applied.text, applied.tokens), guarded.tokens).trim()
+      if (!local || normalizeForCompare(local) === normalizeForCompare(source)) return this.skip('只有术语')
+      return this.finish(local, stripTokens(restore(applied.text, applied.tokens)), source, null)
+    }
     const key = createHash('sha1').update(`${direction}\n${this.glossary?.version ?? ''}\n${source.replace(/\s+/g, ' ')}`).digest('hex')
     const cached = this.cache.get(key)
     if (cached && this.now() - cached.at < CACHE_TTL) {
       this.cache.delete(key)
       this.cache.set(key, cached)
       this.count('缓存命中')
+      if (cached.text === null) return this.skip('译文与原文相同')
       return { ok: true, text: cached.text }
     }
 
@@ -183,17 +198,30 @@ export class TranslationService {
       return this.fail(result.reason)
     }
     const text = restore(restore(result.text, applied.tokens), guarded.tokens).trim()
+    // 送审的文字不带被保护的内容（用户名、QQ 号、网址等），只还原术语
+    return this.finish(text, stripTokens(restore(result.text, applied.tokens)), source, key)
+  }
+
+  /** 译文的最后几步：和原文比较、关键词、审核、缓存。key 为 null 时不缓存（本地生成的译文）。 */
+  private async finish(text: string, forModeration: string, source: string, key: string | null): Promise<TranslationOutcome> {
     if (!text) return this.fail('空结果')
+    if (normalizeForCompare(text) === normalizeForCompare(source)) {
+      if (key) this.remember(key, null)
+      return this.skip('译文与原文相同')
+    }
     if (this.keywords?.matches(text)) return this.fail('关键词命中译文')
     if (this.getSettings().filter.moderation) {
-      // 送审的文字不带被保护的内容（用户名、QQ 号、网址等），只还原术语
-      const checked = await this.moderator.check(stripTokens(restore(result.text, applied.tokens)))
+      const checked = await this.moderator.check(forModeration)
       if (!checked.ok) return this.fail(checked.reason)
       if (checked.flagged) return this.fail('审核未通过')
     }
-    this.cache.set(key, { text, at: this.now() })
-    if (this.cache.size > CACHE_SIZE) this.cache.delete(this.cache.keys().next().value as string)
+    if (key) this.remember(key, text)
     this.count('成功')
     return { ok: true, text }
+  }
+
+  private remember(key: string, text: string | null) {
+    this.cache.set(key, { text, at: this.now() })
+    if (this.cache.size > CACHE_SIZE) this.cache.delete(this.cache.keys().next().value as string)
   }
 }

@@ -73,6 +73,24 @@ describe('官方名称表', () => {
     expect(glossary.apply('staging in CATCH', 'en2zh').hints).toEqual(['Catch => 卡奇'])
   })
 
+  it('地名每个词都是常用词、或以 The 开头 → 按常用词处理（只作 hint、首字母大写且不在句首）', () => {
+    const places: EveEntry[] = [
+      { en: 'Dead End', zh: '绝境', kind: 'system' },
+      { en: 'Pure Blind', zh: '纯盲', kind: 'region' },
+      { en: 'The Citadel', zh: '城堡', kind: 'region' },
+      { en: 'Molden Heath', zh: '莫德尔', kind: 'region' },
+    ]
+    const { glossary: g } = buildGlossary(opts(), { eveData: eve(places), commonWords: new Set(['dead', 'end', 'pure', 'blind', 'heath']) })
+    expect(g.apply('dead end road', 'en2zh')).toEqual({ text: 'dead end road', tokens: [], hints: [] })
+    expect(g.apply('Dead End road', 'en2zh').hints).toEqual([])
+    expect(g.apply('go to Dead End', 'en2zh')).toEqual({ text: 'go to Dead End', tokens: [], hints: ['Dead End => 绝境'] })
+    expect(g.apply('rat in Pure Blind', 'en2zh').tokens).toEqual([])
+    expect(g.apply('form up at the citadel', 'en2zh')).toEqual({ text: 'form up at the citadel', tokens: [], hints: [] })
+    expect(g.apply('form up at The Citadel', 'en2zh')).toEqual({ text: 'form up at The Citadel', tokens: [], hints: ['The Citadel => 城堡'] })
+    // 有一个词不是常用词 → 仍然 force
+    expect(g.apply('roam molden heath', 'en2zh').tokens).toEqual([{ token: '⟦G0⟧', value: 'Molden Heath(莫德尔)' }])
+  })
+
   it('「吉他」中译英只作 hint；少于 3 个字、不以「级」结尾的中文只作 hint', () => {
     expect(glossary.apply('今晚去吉他买东西', 'zh2en')).toEqual({ text: '今晚去吉他买东西', tokens: [], hints: ['Jita => 吉他'] })
     expect(glossary.apply('挖凡晶', 'zh2en')).toEqual({ text: '挖凡晶', tokens: [], hints: ['Veldspar => 凡晶'] })
@@ -146,12 +164,23 @@ describe('黑话表和 overrides', () => {
     expect(noAlias.apply('pls x up', 'en2zh').tokens).toEqual([{ token: '⟦G0⟧', value: '打X' }])
   })
 
-  it('keep 还原成原文写法', () => {
+  it('keep 还原成目标侧的标准写法，不是原文写法', () => {
     const r = glossary.apply('Call To Arms now, CTA!', 'en2zh')
     expect(r.text).toBe('⟦G0⟧ now, ⟦G1⟧!')
-    expect(r.tokens).toEqual([{ token: '⟦G0⟧', value: 'Call To Arms' }, { token: '⟦G1⟧', value: 'CTA' }])
+    expect(r.tokens).toEqual([{ token: '⟦G0⟧', value: 'CTA' }, { token: '⟦G1⟧', value: 'CTA' }])
     const z = glossary.apply('明天全员集结', 'zh2en')
-    expect(restore(z.text, z.tokens)).toBe('明天全员集结')
+    expect(restore(z.text, z.tokens)).toBe('明天CTA')
+  })
+
+  it('keep：en == zh 时按自己的写法匹配，还原成标准写法；英文带复数 s 时补 s', () => {
+    const { glossary: g } = build([], [{ en: 'Keepstar', zh: 'Keepstar', mode: 'keep', dir: 'both' }])
+    const r = g.apply('two KEEPSTARS and a keepstar', 'en2zh')
+    expect(restore(r.text, r.tokens)).toBe('two Keepstars and a Keepstar')
+    expect(g.apply('打Keepstar', 'zh2en').tokens).toEqual([{ token: '⟦G0⟧', value: 'Keepstar' }])
+    expect(glossary.apply('two CTAs', 'en2zh').tokens).toEqual([{ token: '⟦G0⟧', value: 'CTAs' }])
+    // 标准写法不以英文字母结尾（中文）时不补 s
+    const { glossary: zh } = build([], [{ en: 'ping', zh: '集合令', mode: 'keep', dir: 'en2zh' }])
+    expect(zh.apply('two pings', 'en2zh').tokens).toEqual([{ token: '⟦G0⟧', value: '集合令' }])
   })
 
   it('force 输出标准写法；hint 不替换；dir 限定方向', () => {
@@ -303,6 +332,34 @@ describe('数据文件', () => {
     } else {
       expect(data).toBeNull()
     }
+  })
+})
+
+describe('真实数据文件：地名按常用词处理', () => {
+  const data = loadEveData()
+  const g = data && buildGlossary(opts(), { eveData: data, commonWords: loadCommonWords() }).glossary
+  const valueOf = (en: string) => data!.entries.find((e) => e.en === en)!.zh
+
+  it.skipIf(!g)('dead end、central point、promised land、the citadel 不被强制替换', () => {
+    for (const text of ['that is a dead end', 'the central point of it', 'the promised land', 'We reached a Dead End']) {
+      expect(g!.apply(text, 'en2zh').tokens, text).toEqual([])
+    }
+    expect(g!.apply('see you at Central Point', 'en2zh').hints).toContain(`Central Point => ${valueOf('Central Point')}`)
+    // 星域 The Citadel 不匹配；小写的 citadel 仍可能匹配到同名的组别 Citadel（不是地名，不受这条规则影响）
+    const r = g!.apply('form up at the citadel', 'en2zh')
+    expect(r.hints.some((h) => h.startsWith('The Citadel'))).toBe(false)
+    expect(r.tokens.some((t) => t.value.includes(valueOf('The Citadel')))).toBe(false)
+    const cap = g!.apply('form up in The Citadel', 'en2zh')
+    expect(cap.hints).toContain(`The Citadel => ${valueOf('The Citadel')}`)
+    expect(cap.tokens.some((t) => t.value.includes(valueOf('The Citadel')))).toBe(false)
+  })
+
+  it.skipIf(!g)('有一个词不在常用词表里的多词地名（Etherium Reach）仍然 force', () => {
+    const words = loadCommonWords()
+    expect(words.has('etherium')).toBe(false)
+    expect(words.has('reach')).toBe(true)
+    expect(g!.apply('roaming etherium reach tonight', 'en2zh').tokens)
+      .toEqual([{ token: '⟦G0⟧', value: `Etherium Reach(${valueOf('Etherium Reach')})` }])
   })
 })
 

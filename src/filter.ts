@@ -49,16 +49,19 @@ export class KeywordFilter {
   }
 }
 
-function hostname(url: string) {
+/** origin（小写、去默认端口）+ 去掉末尾斜杠的路径；不是 http(s) 网址时 null。 */
+function endpoint(url: string) {
   try {
-    return new URL(String(url).trim()).hostname.toLowerCase()
+    const u = new URL(String(url).trim())
+    if (u.protocol !== 'https:' && u.protocol !== 'http:') return null
+    return `${u.origin.toLowerCase()}${u.pathname.replace(/\/+$/, '')}`
   } catch {
     return null
   }
 }
 
 /**
- * 审核用哪个 key：填了审核 key 就用它；没填时只有翻译和审核接口的主机名相同才借用翻译 key；
+ * 审核用哪个 key：填了审核 key 就用它；没填时只有翻译和审核接口的 origin（协议、主机、端口）和路径都相同才借用翻译 key（B8）；
  * 否则 null（绝不能把别家的 key 发给 OpenAI）。
  */
 export function resolveModerationKey(translateBaseURL: string, translateKey: string, moderationBaseURL: string, moderationKey: string): string | null {
@@ -66,8 +69,8 @@ export function resolveModerationKey(translateBaseURL: string, translateKey: str
   if (own) return own
   const borrowed = String(translateKey ?? '').trim()
   if (!borrowed) return null
-  const a = hostname(translateBaseURL)
-  const b = hostname(moderationBaseURL)
+  const a = endpoint(translateBaseURL)
+  const b = endpoint(moderationBaseURL)
   return a && b && a === b ? borrowed : null
 }
 
