@@ -7,6 +7,8 @@ export interface ContentEnv {
   userName(id: string): string | undefined
   roleName(id: string): string | undefined
   channelName(id: string): string | undefined
+  /** 可选：每渲染出一个要保护的记号（提及、频道、表情、时间、斜杠命令、频道导航）就回调一次（清单 §12.1 第 2 步）。 */
+  onToken?(text: string): void
 }
 
 // 占位符：受保护的片段（代码、提及、链接、转义字符……）先换成 序号，处理完 Markdown 再换回来
@@ -20,16 +22,26 @@ const ESCAPABLE = new Set(['*', '#', '_', '~', '|', '>', '<', '`', '\\', '-', '[
 type Rule = [RegExp, (m: RegExpExecArray, env: ContentEnv) => string]
 
 // 以 `<` 开头的记号。都用 y（sticky）在当前位置匹配
+// 报告一个受保护记号，原样返回
+function tok(env: ContentEnv, s: string): string {
+  env.onToken?.(s)
+  return s
+}
+
 const ANGLE: Rule[] = [
-  [/<@!?(\d+)>/y, (m, env) => '@' + (env.userName(m[1]) ?? '用户')],
-  [/<@&(\d+)>/y, (m, env) => '@' + (env.roleName(m[1]) ?? '角色')],
-  [/<#(\d+)>/y, (m, env) => '#' + (env.channelName(m[1]) ?? '频道')],
+  [/<@!?(\d+)>/y, (m, env) => tok(env, '@' + (env.userName(m[1]) ?? '用户'))],
+  [/<@&(\d+)>/y, (m, env) => tok(env, '@' + (env.roleName(m[1]) ?? '角色'))],
+  [/<#(\d+)>/y, (m, env) => tok(env, '#' + (env.channelName(m[1]) ?? '频道'))],
   // 自定义表情，名字非贪婪，保证一条消息里两个表情各自匹配
-  [/<a?:([^:<>\s]+?):(\d+)>/y, (m) => `[${m[1]}]`],
-  [/<t:(-?\d+)(?::([A-Za-z]))?>/y, (m, env) => formatTimestamp(Number(m[1]), m[2], env.timeZone, env.now) ?? m[0]],
+  [/<a?:([^:<>\s]+?):(\d+)>/y, (m, env) => tok(env, `[${m[1]}]`)],
+  // 换算失败时原样输出，不算记号
+  [/<t:(-?\d+)(?::([A-Za-z]))?>/y, (m, env) => {
+    const t = formatTimestamp(Number(m[1]), m[2], env.timeZone, env.now)
+    return t != null ? tok(env, t) : m[0]
+  }],
   // 斜杠命令提及：</name:id>、</name sub:id>、</name group sub:id>
-  [/<\/([^:<>\n]+):(\d+)>/y, (m) => '/' + m[1]],
-  [/<id:(?:customize|browse|guide|linked-roles|home)(?::\d+)?>/y, () => '[频道导航]'],
+  [/<\/([^:<>\n]+):(\d+)>/y, (m, env) => tok(env, '/' + m[1])],
+  [/<id:(?:customize|browse|guide|linked-roles|home)(?::\d+)?>/y, (_, env) => tok(env, '[频道导航]')],
   [/<(https?:\/\/[^\s<>]+)>/y, (m) => m[1]],
 ]
 
