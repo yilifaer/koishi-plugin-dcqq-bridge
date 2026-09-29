@@ -40,10 +40,7 @@ export function protect(text: string, spans: string[]): { text: string; tokens: 
     taken.push([start, end])
     return true
   }
-  // 1. 原文里的 ⟦⟧；2. 网址
-  for (const m of text.matchAll(LITERAL)) claim(m.index!, m.index! + m[0].length)
-  for (const m of text.matchAll(URL_RE)) claim(m.index!, m.index! + trimUrl(m[0]).length)
-  // 3. 提及、表情、时间等（长的优先，每一处都要）
+  // 1. 提及、表情、时间等（长的优先，每一处都要）：先占，名字里带 ⟦⟧ 或网址时整段一起保护，不漏出一部分
   const list = [...new Set(spans.filter((s) => s && s.trim()))].sort((a, b) => b.length - a.length)
   for (const span of list) {
     let from = 0
@@ -54,6 +51,9 @@ export function protect(text: string, spans: string[]): { text: string; tokens: 
       from = i + 1
     }
   }
+  // 2. 原文里的 ⟦⟧；3. 网址
+  for (const m of text.matchAll(LITERAL)) claim(m.index!, m.index! + m[0].length)
+  for (const m of text.matchAll(URL_RE)) claim(m.index!, m.index! + trimUrl(m[0]).length)
   // 4. 其余规则：最左、最长优先
   const found: Range[] = []
   for (const re of PATTERNS) {

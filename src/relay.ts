@@ -79,6 +79,8 @@ export class Relay {
   private disposed = false
   private warnedNoSeq = false
   private loaded: Promise<void>
+  private resolveLoaded!: () => void
+  private starting: Promise<void> | null = null
   private checkTimer: NodeJS.Timeout | null = null
   private dateOf: (ms: number) => string
   private sleep?: RelayOptions['sleep']
@@ -99,7 +101,8 @@ export class Relay {
       if (row.invalid) this.logger.warn(`第 ${row.index} 行桥无效，已跳过：${row.invalid}`)
       for (const warning of row.warnings) this.logger.warn(`第 ${row.index} 行：${warning}`)
     }
-    this.loaded = Promise.resolve()
+    // 暂停状态、lastseen 读完之前，用到它们的地方都要等（start() 读完后 resolve）
+    this.loaded = new Promise((resolve) => (this.resolveLoaded = resolve))
   }
 
   // ---------------------------------------------------------------- 生命周期
@@ -132,15 +135,19 @@ export class Relay {
     }
   }
 
-  async start() {
-    this.loaded = this.load()
-    await this.loaded
+  start() {
+    return this.starting ??= this.doStart()
+  }
+
+  private async doStart() {
+    await this.load()
+    this.resolveLoaded()
     if (this.options.timers !== false) {
       this.ctx.setInterval(() => void this.flushLastseen().catch(() => {}), 10000)
       this.ctx.setInterval(() => void this.hourly().catch(() => {}), 3600000)
     }
-    await this.hourly().catch(() => {})
     await this.translation.reload().catch((e) => this.logger.warn('读取关键词、术语表出错：%s', describeError(e)))
+    await this.hourly().catch(() => {})
     // 插件加载时 Discord 机器人已经在线（例如控制台保存后重载）：补一次
     const bot = this.discordBot()
     if (bot?.status === Universal.Status.ONLINE && bot.selfId) {
@@ -187,7 +194,7 @@ export class Relay {
   async dispose() {
     this.disposed = true
     if (this.checkTimer) clearTimeout(this.checkTimer)
-    await this.flushLastseen().catch(() => {})
+    if (this.starting) await this.flushLastseen().catch(() => {})
   }
 
   private async hourly() {
@@ -294,8 +301,12 @@ export class Relay {
   }
 
   private startTranslation(msg: Msg, bridges: Bridge[], blocked: Set<string>, direction: 'en2zh' | 'zh2en') {
-    if (!bridges.some((b) => !blocked.has(b.key) && this.needsTranslation(b))) return undefined
-    return this.translation.translate(msg, direction).catch((e): TranslationOutcome => {
+    if (!this.settings.translate.enabled || !bridges.some((b) => !blocked.has(b.key) && b.translate)) return undefined
+    // 暂停状态读完之后再判断（插件刚加载时 pausetr 还没读进来）
+    return this.loaded.then(() => {
+      if (!bridges.some((b) => !blocked.has(b.key) && this.needsTranslation(b))) return { ok: false, reason: '翻译暂停', skipped: true } as TranslationOutcome
+      return this.translation.translate(msg, direction)
+    }).catch((e): TranslationOutcome => {
       this.logger.warn('翻译出错：%s', describeError(e))
       return { ok: false, reason: '翻译出错', skipped: false }
     })

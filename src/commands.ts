@@ -65,7 +65,9 @@ export async function statusText(relay: Relay, filter: (b: { discord: string; qq
   if (settings.translate.enabled) {
     const t = relay.translation.translator.stats()
     const reasons = Object.entries(t.failures).map(([r, n]) => `${r} ${n}`).join('、')
-    lines.push(`翻译：请求 ${t.requests} 次，用量 ${t.promptTokens + t.completionTokens} tokens${reasons ? `，失败：${reasons}` : ''}`)
+    lines.push(`翻译：请求 ${t.requests} 次，用量 ${t.promptTokens + t.completionTokens} tokens${reasons ? `，请求失败：${reasons}` : ''}`)
+    const outcomes = [...relay.translation.outcomes].filter(([r]) => r !== '成功').map(([r, n]) => `${r} ${n}`).join('、')
+    if (outcomes) lines.push(`   没附译文的原因：${outcomes}`)
   }
   for (const platform of ['discord', 'onebot'] as const) {
     const problem = relay.botProblem(platform)

@@ -319,3 +319,34 @@ describe('翻译接进转发', () => {
 })
 
 void DC_CHANNEL
+
+describe('PR 2 审查修正（整体）', () => {
+  it('打开 EVE 术语表后，「Rifter to Amarr」这种短消息照样翻译', async () => {
+    env = await setup(on({ glossary: { eve: true } }))
+    env.discordMessage({ content: 'Rifter to Amarr' })
+    await env.idle()
+    expect(llm.chat).toHaveLength(1)
+  })
+
+  it('送审的文字里没有被保护的名字', async () => {
+    env = await setup(on({ filter: { moderation: true, moderationBaseURL: llm.base } }))
+    env.discordMessage({ content: 'ping <@930000000000000009> for the fleet tonight', mentions: [{ id: '930000000000000009', username: 'wing', global_name: '秘密僚机' }] })
+    await env.idle()
+    expect(llm.moderations).toHaveLength(1)
+    expect(JSON.stringify(llm.moderations[0].json)).not.toContain('秘密僚机')
+  })
+
+  it('审核没有可用的 key 时，连翻译请求都不发', async () => {
+    env = await setup(on({ filter: { moderation: true, moderationBaseURL: 'https://moderation.example.com/v1' } }))
+    env.discordMessage({ content: 'Fleet forms in Jita tonight' })
+    await env.idle()
+    expect(llm.chat).toHaveLength(0)
+  })
+
+  it('写错的关键词只显示第几条，不显示内容', async () => {
+    env = await setup(on({ filter: { keywords: '正常词\nre:秘密(' } }))
+    const status = (await env.command(OWNER_QQ, 'bridge.status')).join('\n')
+    expect(status).toContain('关键词第 2 条写错')
+    expect(status).not.toContain('秘密(')
+  })
+})

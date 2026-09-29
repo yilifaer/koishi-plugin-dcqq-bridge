@@ -125,7 +125,7 @@ export function normalizeSettings(config: Partial<Config>): Settings {
   const gl: any = config.glossary && typeof config.glossary === 'object' ? config.glossary : {}
   // 标注去掉空白和零宽字符后为空，就用【机翻】（清单 §4.4）
   let label = text(tr.label, '【机翻】').trim()
-  if (!label.replace(/[\s\u200b-\u200d\u2060\ufeff]/g, '')) {
+  if (!label.replace(/[\s\p{Cf}\u034f\u115f\u1160\u3164\uffa0]/gu, '')) {
     if (tr.label !== undefined) problems.push('译文标注不能为空，已改用「【机翻】」')
     label = '【机翻】'
   }
