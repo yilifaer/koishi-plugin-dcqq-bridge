@@ -13,6 +13,7 @@ export interface BridgeRow {
   enabled: boolean
   atAll: boolean
   blockWords: string
+  translate: boolean
 }
 
 export interface AtAllConfig {
@@ -21,6 +22,34 @@ export interface AtAllConfig {
   dailyCap: number
   cooldownMinutes: number
   maxAgeMinutes: number
+}
+
+export type GlossaryMode = 'keep' | 'force' | 'hint'
+export type GlossaryDir = 'both' | 'en2zh' | 'zh2en'
+
+export interface TranslateConfig {
+  enabled: boolean
+  baseURL: string
+  apiKey: string
+  model: string
+  label: string
+  timeoutMs: number
+  maxPerHour: number
+}
+
+export interface FilterConfig {
+  keywords: string
+  keywordFile: string
+  moderation: boolean
+  moderationBaseURL: string
+  moderationApiKey: string
+}
+
+export interface GlossaryConfig {
+  eve: boolean
+  systemStyle: 'en(zh)' | 'en' | 'zh'
+  slangFile: string
+  overrides: Array<{ en: string; zh: string; mode: GlossaryMode; dir: GlossaryDir }>
 }
 
 export interface Config {
@@ -33,6 +62,9 @@ export interface Config {
   qqReorderMs: number
   bridges: BridgeRow[]
   atAll: AtAllConfig
+  translate: TranslateConfig
+  filter: FilterConfig
+  glossary: GlossaryConfig
 }
 
 const str = (value = '') => Schema.string().default(value).loose()
@@ -70,8 +102,9 @@ export const Config: Schema<Config> = Schema.intersect([
       enabled: bool(true).description('启用'),
       atAll: bool(false).description('@全体'),
       blockWords: str().description('屏蔽词（正则，多个用 ;; 分隔）'),
+      translate: bool(false).description('翻译'),
     })).role('table').default([]).loose()
-      .description('一行一个桥：连接一个 Discord 频道和一个 QQ 群。一个 Discord 频道要发往两个 QQ 群就写两行。ID 必须是纯数字；写错的行会被跳过，并在 `bridge.status` 里标出来。**@全体** 只对 Discord → QQ 方向有效，只有真正的 @everyone / @here 才会触发。**屏蔽词**：每一条是一个正则表达式（普通的词直接写），不区分大小写，检查正文、embed 和文件名，命中就不转发这条。'),
+      .description('一行一个桥：连接一个 Discord 频道和一个 QQ 群。一个 Discord 频道要发往两个 QQ 群就写两行。ID 必须是纯数字；写错的行会被跳过，并在 `bridge.status` 里标出来。**@全体** 只对 Discord → QQ 方向有效，只有真正的 @everyone / @here 才会触发。**翻译**：还要打开下面「翻译」里的总开关才生效。**屏蔽词**：每一条是一个正则表达式（普通的词直接写），不区分大小写，检查正文、embed 和文件名，命中就不转发这条。'),
   }).description('桥'),
 
   Schema.object({
@@ -88,4 +121,68 @@ export const Config: Schema<Config> = Schema.intersect([
         .description('Discord 消息发出超过这么多分钟就不再 @全体（例如断线后补发、网关重放的旧消息）。'),
     }).default({} as AtAllConfig).loose(),
   }).description('@全体'),
+
+  Schema.object({
+    translate: Schema.object({
+      enabled: bool(false)
+        .description('翻译总开关。打开后，表格里勾了「翻译」的桥会在原文后面附上机器翻译（英译中、中译英）。翻译失败或超时就只发原文。'),
+      baseURL: str()
+        .description('OpenAI 兼容接口的地址，例如 `https://api.openai.com/v1`、`https://api.deepseek.com/v1`。插件不预设任何服务商。'),
+      apiKey: Schema.string().role('secret').default('').loose()
+        .description('API key。只填在这里，不要发给任何人。'),
+      model: str()
+        .description('模型名，例如 `gpt-4o-mini`、`deepseek-chat`。'),
+      label: str('【机翻】')
+        .description('译文前的标注，不能为空（为空时自动用「【机翻】」）。'),
+      timeoutMs: num(6000)
+        .description('翻译请求最多等多少毫秒，超过就只发原文。'),
+      maxPerHour: num(0)
+        .description('每小时最多请求几次，0 = 不限。超过就只发原文。'),
+    }).default({} as TranslateConfig).loose(),
+  }).description('翻译'),
+
+  Schema.object({
+    filter: Schema.object({
+      keywords: Schema.string().role('textarea').default('').loose()
+        .description('关键词，一行一个，不区分大小写。`re:` 开头的按正则（英文词建议写成 `re:\\bword\\b`）。原文命中就不翻译，译文命中就不附译文；不影响原文转发。'),
+      keywordFile: str()
+        .description('可选：关键词文件路径（相对 Koishi 实例目录），格式同上，`#` 开头是注释。用 `bridge.reload` 重新读取。'),
+      moderation: bool(false)
+        .description('用 OpenAI 审核接口检查译文，被标记就不附译文。出错、超时或没有可用的 key 时也不附译文。'),
+      moderationBaseURL: str('https://api.openai.com/v1')
+        .description('审核接口地址（只有 OpenAI 提供这个接口）。'),
+      moderationApiKey: Schema.string().role('secret').default('').loose()
+        .description('审核接口的 key。留空时，只有当翻译接口和审核接口是同一个网站时才借用翻译的 key；否则必须填，插件绝不会把别家的 key 发给 OpenAI。'),
+    }).default({} as FilterConfig).loose(),
+  }).description('过滤'),
+
+  Schema.object({
+    glossary: Schema.object({
+      eve: bool(false)
+        .description('使用插件自带的 EVE 官方名称表（物品、组别、类别、星系、星域、星座的中英文名）。'),
+      systemStyle: Schema.union([
+        Schema.const('en(zh)' as const).description('Jita(吉他)'),
+        Schema.const('en' as const).description('Jita'),
+        Schema.const('zh' as const).description('吉他'),
+      ]).default('en(zh)').loose()
+        .description('有名字的星系、星域、星座在英译中时怎么写。代号星系（例如 1DQ1-A）永远不翻。'),
+      slangFile: str()
+        .description('黑话表文件路径（YAML，相对 Koishi 实例目录）。格式见插件自带的 `data/eve-slang.example.yaml`。写错时只记错误，照常转发。用 `bridge.reload` 重新读取。'),
+      overrides: Schema.array(Schema.object({
+        en: str().description('英文'),
+        zh: str().description('中文'),
+        mode: Schema.union([
+          Schema.const('force' as const).description('强制替换'),
+          Schema.const('keep' as const).description('原样保留'),
+          Schema.const('hint' as const).description('只作参考'),
+        ]).default('force').loose().description('模式'),
+        dir: Schema.union([
+          Schema.const('both' as const).description('双向'),
+          Schema.const('en2zh' as const).description('英译中'),
+          Schema.const('zh2en' as const).description('中译英'),
+        ]).default('both').loose().description('方向'),
+      })).role('table').default([]).loose()
+        .description('自己加的词条，优先级最高。'),
+    }).default({} as GlossaryConfig).loose(),
+  }).description('术语表'),
 ]) as Schema<Config>
