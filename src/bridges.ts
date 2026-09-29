@@ -1,5 +1,6 @@
 // 配置的运行时检查（清单 §4、§0「配置出错的原则」）：坏的一行跳过、写日志、在 bridge.status 里标出来，其他照常工作。
 
+import { INVALID_ROW_KEY } from './config'
 import type { AtAllConfig, BridgeRow, Config, Direction, GlossaryDir, GlossaryMode } from './config'
 import { isValidTimeZone } from './discord/timestamp'
 
@@ -68,6 +69,8 @@ export interface Settings {
   keepDays: number
   authority: number
   qqReorderMs: number
+  /** 消息在队列里最多等几分钟，0 = 不限制。 */
+  maxQueueAgeMinutes: number
   atAll: AtAllConfig
   translate: TranslateSettings
   filter: FilterSettings
@@ -162,6 +165,7 @@ export function normalizeSettings(config: Partial<Config>): Settings {
     keepDays: clampInt(config.keepDays, 7, 1, 3650),
     authority: clampInt(config.authority, 4, 0, 5),
     qqReorderMs: clampInt(config.qqReorderMs, 0, 0, 10000),
+    maxQueueAgeMinutes: clampInt(config.maxQueueAgeMinutes, 15, 0, 1440),
     atAll: {
       fallbackText: text(atAll.fallbackText, '【全体通知】'),
       reserve: clampInt(atAll.reserve, 0, 0, 1000),
@@ -192,7 +196,9 @@ export function normalizeSettings(config: Partial<Config>): Settings {
   const rows: BridgeRow[] = Array.isArray(config.bridges) ? config.bridges : []
   const seen = new Map<string, RowStatus>()
   rows.forEach((raw: any, i) => {
-    const row = raw && typeof raw === 'object' ? raw : {}
+    // 整行校验失败时 schema 返回的是光秃秃的哨兵（没有补默认值）；空行（null）会补上默认值，按普通空行处理
+    const broken = !raw || typeof raw !== 'object' || Array.isArray(raw) || (raw[INVALID_ROW_KEY] === true && !('direction' in raw))
+    const row = broken ? {} : raw
     const status: RowStatus = {
       index: i + 1,
       label: text(row.label).trim(),
@@ -205,6 +211,10 @@ export function normalizeSettings(config: Partial<Config>): Settings {
       bridge: null,
     }
     settings.rows.push(status)
+    if (broken) {
+      status.invalid = `第 ${i + 1} 行有写错的字段（例如方向、启用写成了别的值），已跳过`
+      return
+    }
     if (status.discord && status.qq) settings.allKeys.add(bridgeKey(status.discord, status.qq))
     if (!/^\d+$/.test(status.discord)) {
       status.invalid = status.discord ? 'Discord 频道 ID 必须是纯数字' : 'Discord 频道 ID 为空（在配置文件里写 ID 时要加引号）'

@@ -2,6 +2,8 @@ import { Schema } from 'koishi'
 
 // 清单 §0「配置出错的原则」：Schema 校验失败会让整个插件加载失败（cordis 的行为），
 // 所以每个字段都只做宽松的类型声明并加 .loose()（类型不对时回退到默认值，而不是报错），具体检查放到运行时（bridges.ts）。
+// 例外：桥的每一行整体 loose（A6）。方向和几个开关不单独 loose，写错时整行回退成 INVALID_ROW，由运行时标成无效；
+// 行仍是 Schema.object，控制台表格照常可编辑。
 
 export type Direction = 'both' | 'd2q' | 'q2d'
 
@@ -15,6 +17,10 @@ export interface BridgeRow {
   blockWords: string
   translate: boolean
 }
+
+/** 桥的一行写错时回退到的哨兵：带这个键的行在运行时标成无效（A6）。 */
+export const INVALID_ROW_KEY = '__invalidRow'
+const INVALID_ROW = { [INVALID_ROW_KEY]: true } as unknown as BridgeRow
 
 export interface AtAllConfig {
   fallbackText: string
@@ -60,6 +66,8 @@ export interface Config {
   keepDays: number
   authority: number
   qqReorderMs: number
+  // 可选：旧的测试配置里没有这个字段，运行时按 15 处理
+  maxQueueAgeMinutes?: number
   bridges: BridgeRow[]
   atAll: AtAllConfig
   translate: TranslateConfig
@@ -70,6 +78,8 @@ export interface Config {
 const str = (value = '') => Schema.string().default(value).loose()
 const num = (value: number) => Schema.number().default(value).loose()
 const bool = (value: boolean) => Schema.boolean().default(value).loose()
+// 不加 loose：写错时让整行失败（只用在桥的行里）
+const strictBool = (value: boolean) => Schema.boolean().default(value)
 
 export const Config: Schema<Config> = Schema.intersect([
   Schema.object({
@@ -87,6 +97,8 @@ export const Config: Schema<Config> = Schema.intersect([
       .description('管理命令（`bridge.status` 等）需要的 Koishi 权限等级。'),
     qqReorderMs: num(0)
       .description('QQ 带回复的消息可能比后面的消息晚一点到。填大于 0 的毫秒数（建议 1000）时，每条 QQ 消息先等这么久，按 QQ 的消息序号排好再转发；0 = 不等待。'),
+    maxQueueAgeMinutes: num(15)
+      .description('消息在队列里等太久（例如 Discord 长时间连不上）就丢掉，不再发出，单位分钟；0 = 不限制。'),
   }).description('基本'),
 
   Schema.object({
@@ -98,12 +110,12 @@ export const Config: Schema<Config> = Schema.intersect([
         Schema.const('both' as const).description('双向'),
         Schema.const('d2q' as const).description('Discord → QQ'),
         Schema.const('q2d' as const).description('QQ → Discord'),
-      ]).default('both').loose().description('方向'),
-      enabled: bool(true).description('启用'),
-      atAll: bool(false).description('@全体'),
+      ]).default('both').description('方向'),
+      enabled: strictBool(true).description('启用'),
+      atAll: strictBool(false).description('@全体'),
       blockWords: str().description('屏蔽词（正则，多个用 ;; 分隔）'),
-      translate: bool(false).description('翻译'),
-    })).role('table').default([]).loose()
+      translate: strictBool(false).description('翻译'),
+    }).default(INVALID_ROW).loose()).role('table').default([]).loose()
       .description('一行一个桥：连接一个 Discord 频道和一个 QQ 群。一个 Discord 频道要发往两个 QQ 群就写两行。ID 必须是纯数字；写错的行会被跳过，并在 `bridge.status` 里标出来。**@全体** 只对 Discord → QQ 方向有效，只有真正的 @everyone / @here 才会触发。**翻译**：还要打开下面「翻译」里的总开关才生效。**屏蔽词**：每一条是一个正则表达式（普通的词直接写），不区分大小写，检查正文、embed 和文件名，命中就不转发这条。'),
   }).description('桥'),
 

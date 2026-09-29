@@ -34,10 +34,16 @@ export interface SendOptions {
   onRateLimit?: (ms: number) => void
   /** 测试用：替换等待函数。 */
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>
+  /** 测试用：替换时钟。 */
+  now?: () => number
 }
 
 const CONNECT_CODES = new Set(['UND_ERR_CONNECT_TIMEOUT', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN'])
 const RETRY_DELAYS = [2000, 10000]
+/** 一次发送最多被 429 几次。 */
+const RATE_RETRIES = 5
+/** 429 没说等多久时至少等这么久。 */
+const RATE_UNKNOWN_MS = 2000
 
 export function defaultSleep(ms: number, signal: AbortSignal) {
   return new Promise<void>((resolve, reject) => {
@@ -56,7 +62,7 @@ export function defaultSleep(ms: number, signal: AbortSignal) {
 
 type Failure =
   | { kind: 'connect' }
-  | { kind: 'rate'; ms: number }
+  | { kind: 'rate'; ms: number; global?: boolean }
   | { kind: 'tooLarge' }
   | { kind: 'username' }
   | { kind: 'unknownWebhook' }
@@ -69,10 +75,13 @@ export function classify(http: any, error: unknown): Failure {
     const status = e.response.status
     const data = e.response.data && typeof e.response.data === 'object' ? e.response.data : {}
     if (status === 429) {
-      let seconds = Number(data.retry_after)
-      if (!Number.isFinite(seconds)) seconds = Number(e.response.headers?.get?.('retry-after'))
-      if (!Number.isFinite(seconds) || seconds < 0) seconds = 1
-      return { kind: 'rate', ms: Math.ceil(seconds * 1000) }
+      const header = e.response.headers?.get?.('retry-after')
+      let seconds = data.retry_after === undefined || data.retry_after === null || data.retry_after === '' ? NaN : Number(data.retry_after)
+      if (!Number.isFinite(seconds) && header !== null && header !== undefined && header !== '') seconds = Number(header)
+      // 没说等多久（或写得不对）：按未知处理，至少等 2 秒
+      const ms = Number.isFinite(seconds) && seconds >= 0 ? Math.ceil(seconds * 1000) : RATE_UNKNOWN_MS
+      const global = data.global === true || e.response.headers?.get?.('x-ratelimit-global') === 'true'
+      return global ? { kind: 'rate', ms, global } : { kind: 'rate', ms }
     }
     if (status === 413 || data.code === 40005) return { kind: 'tooLarge' }
     if (data.code === 10015) return { kind: 'unknownWebhook' }
@@ -104,29 +113,22 @@ function buildBody(payload: DiscordPayload, mode: 'webhook' | 'bot') {
   return { body: form, multipart: true }
 }
 
-/** 去掉最大的那个文件，换成占位文字（413 时用）。 */
-function dropLargest(payload: DiscordPayload): DiscordPayload {
+/** 这一批的文件全部换成占位文字（413 时用；这样一定能发出去）。 */
+function dropAll(payload: DiscordPayload): DiscordPayload {
   if (!payload.files.length) return payload
-  let largest = 0
-  payload.files.forEach((file, i) => {
-    if (file.data.byteLength > payload.files[largest].data.byteLength) largest = i
-  })
-  const dropped = payload.files[largest]
-  const placeholder = escapeDiscord(dropped.placeholder)
+  const placeholders = cutUnits(payload.files.map((file) => escapeDiscord(file.placeholder)).join('\n'), 2000)
   // 加上占位文字后仍不能超过 2000 字，放不下时截掉正文末尾
-  const room = 2000 - placeholder.length - 1
-  const content = payload.content ? `${cutUnits(payload.content, room)}\n${placeholder}` : placeholder
-  return {
-    ...payload,
-    content,
-    files: payload.files.filter((_, i) => i !== largest),
-  }
+  const room = 2000 - placeholders.length - 1
+  const content = payload.content && room > 0 ? `${cutUnits(payload.content, room)}\n${placeholders}` : placeholders
+  return { ...payload, content, files: [] }
 }
 
 export class DiscordSender {
   /** 插件自己的 webhook ID（防自我回环，清单 §6.3）。 */
   ownWebhooks = new Set<string>()
   private webhookWarned = new Map<string, number>()
+  /** 被限流到什么时候：`webhook:<id>`、`channel:<id>`、`global`。 */
+  private limitedUntil = new Map<string, number>()
 
   constructor(private logger: { warn(...args: any[]): void; debug?(...args: any[]): void }) {}
 
@@ -165,19 +167,43 @@ export class DiscordSender {
     }
   }
 
+  /** 这个目标（和全局）被限流到什么时候。 */
+  rateLimitedUntil(key: string, now = Date.now()) {
+    const until = Math.max(this.limitedUntil.get(key) ?? 0, this.limitedUntil.get('global') ?? 0)
+    if (until <= now) {
+      this.limitedUntil.delete(key)
+      if ((this.limitedUntil.get('global') ?? 0) <= now) this.limitedUntil.delete('global')
+      return 0
+    }
+    return until
+  }
+
   /** 发送一次（一个 Discord 请求），按清单 §10 处理重试。 */
   async send(bot: any, channelId: string, payload: DiscordPayload, webhook: Webhook | null, options: SendOptions): Promise<SendResult> {
     const sleep = options.sleep ?? defaultSleep
+    const now = options.now ?? Date.now
     let retries = 0
+    let rateRetries = 0
     let usernameRetried = false
     let largeRetried = false
     let webhookRetried = false
     let wh = webhook
     let current = payload
     while (true) {
-      const remaining = options.deadline - Date.now()
+      const remaining = options.deadline - now()
       if (remaining <= 0 || options.signal.aborted) return { ok: false, reason: '超过 60 秒，放弃', maybeSent: false }
       const mode = wh ? 'webhook' : 'bot'
+      const target = wh ? `webhook:${wh.id}` : `channel:${channelId}`
+      // 之前被限流过：先等到限流结束；等不到就放弃
+      const until = this.rateLimitedUntil(target, now())
+      if (until) {
+        if (until > options.deadline) {
+          this.logger.warn(`发往 Discord 频道 ${channelId} 被限流，要等到 60 秒之后，放弃这条`)
+          return { ok: false, reason: 'Discord 限流，等待时间超过 60 秒', maybeSent: false }
+        }
+        await sleep(until - now(), options.signal).catch(() => {})
+        continue
+      }
       const { body, multipart } = buildBody(current, mode)
       const url = wh ? `/webhooks/${wh.id}/${wh.token}?wait=true` : `/channels/${channelId}/messages`
       try {
@@ -196,18 +222,20 @@ export class DiscordSender {
         switch (failure.kind) {
           case 'connect':
             if (retries >= RETRY_DELAYS.length) return { ok: false, reason, maybeSent: false }
-            await sleep(Math.min(RETRY_DELAYS[retries++], Math.max(0, options.deadline - Date.now())), options.signal).catch(() => {})
+            await sleep(Math.min(RETRY_DELAYS[retries++], Math.max(0, options.deadline - now())), options.signal).catch(() => {})
             continue
           case 'rate':
-            // 整个目标队列一起等（这条就在队首），不计入重试次数，仍受 60 秒限制
+            // 记下限流到什么时候（全局限流记全局），后面发往这个目标的消息先等；仍受 60 秒限制
             options.onRateLimit?.(failure.ms)
-            if (Date.now() + failure.ms > options.deadline) return { ok: false, reason: `${reason}，等待时间超过 60 秒`, maybeSent: false }
-            await sleep(failure.ms, options.signal).catch(() => {})
+            const key = failure.global ? 'global' : target
+            this.limitedUntil.set(key, Math.max(this.limitedUntil.get(key) ?? 0, now() + failure.ms))
+            if (++rateRetries > RATE_RETRIES) return { ok: false, reason: `${reason}，被限流 ${RATE_RETRIES} 次，放弃`, maybeSent: false }
+            if (now() + failure.ms > options.deadline) return { ok: false, reason: `${reason}，等待时间超过 60 秒`, maybeSent: false }
             continue
           case 'tooLarge':
             if (largeRetried || !current.files.length) return { ok: false, reason, maybeSent: false }
             largeRetried = true
-            current = dropLargest(current)
+            current = dropAll(current)
             continue
           case 'username':
             if (usernameRetried || !wh) return { ok: false, reason, maybeSent: false }
