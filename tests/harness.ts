@@ -307,6 +307,7 @@ export async function setup(patch: Partial<Config> = {}, options: { online?: boo
     keepDays: 7,
     authority: 4,
     qqReorderMs: 0,
+    maxQueueAgeMinutes: 15,
     bridges: [bridge()],
     atAll: { fallbackText: '【全体通知】', reserve: 0, dailyCap: 0, cooldownMinutes: 0, maxAgeMinutes: 10 },
     ...PR2_DEFAULTS,
