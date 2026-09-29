@@ -28,6 +28,17 @@ const DISCORD_FILE_LIMIT = 10 * 1024 * 1024
 const QQ_VIDEO_LIMIT = 8 * 1024 * 1024
 const BACKFILL_WINDOW = 6 * 3600 * 1000
 const BACKFILL_MAX = 200
+/** d2q 图片下载上限。 */
+const QQ_IMAGE_LIMIT = 10 * 1024 * 1024
+/** Discord 一次请求的文件总大小上限（留一点余量给表单其他部分）。 */
+const DISCORD_BATCH_BYTES = 24 * 1024 * 1024
+const DISCORD_BATCH_FILES = 10
+/** 插件停止超过这么久再启动：READY 时不补发（alive 心跳）。 */
+const ALIVE_STALE = 15 * 60 * 1000
+const ALIVE_INTERVAL = 60000
+const MEMBER_TIMEOUT = 5000
+/** 群成员名字查询超时后，这么久之内不再查。 */
+const MEMBER_SLOW_TTL = 60000
 
 export interface RelayOptions {
   now?: () => number
@@ -66,17 +77,30 @@ export class Relay {
   /** 自检发现的问题：桥 key → 问题。 */
   health = new Map<string, string[]>()
   private queues = new OrderedQueues()
-  private limiter = new Limiter(4)
+  /** 两个方向各用一个预处理限流器，一个方向堵住不影响另一个（R8）。 */
+  private limiters: Record<Direction, Limiter> = { d2q: new Limiter(4), q2d: new Limiter(4) }
   private seen = new SeenSet(10000)
   private sentIds = new SeenSet(10000)
   private lastseen = new Map<string, string>()
   private lastseenDirty = new Set<string>()
+  /** 数据库里的 lastseen（补发起点用它，不用被实时消息推高的内存值，F3）。 */
+  private persisted = new Map<string, string>()
+  /** lastseen 还是上一次运行留下的（这次运行还没写过）的频道。 */
+  private prevRun = new Set<string>()
+  /** 上一次运行最后的 alive 心跳（毫秒）。 */
+  private loadedAlive: number | undefined
+  private startedAt = 0
+  /** 这个实例安装之后收到过 READY。 */
+  private readyReceived = false
   private roleNames = new TtlCache<Map<string, string>>(NAME_TTL)
   private channelInfo = new TtlCache<{ name?: string; guildId?: string }>(NAME_TTL)
   private memberNames = new TtlCache<string>(NAME_TTL)
+  private memberSlow = new TtlCache<true>(MEMBER_SLOW_TTL)
   private guildOf = new Map<string, string>()
   private reorder = new Map<string, Array<{ seq?: number; arrival: number; release: () => void }>>()
   private disposed = false
+  /** dispose 时中止还在进行的下载。 */
+  private abort = new AbortController()
   private warnedNoSeq = false
   private loaded: Promise<void>
   private resolveLoaded!: () => void
@@ -114,9 +138,10 @@ export class Relay {
       this.onDiscordMessage(d as RawMessage, false)
     }))
     ctx.on('discord/ready', (d: any, bot: any) => this.guard(() => {
-      if (!this.isOurDiscord(bot, d?.user?.id)) return
+      if (this.disposed || !this.isOurDiscord(bot, d?.user?.id)) return
+      this.readyReceived = true
       // 同步取快照：READY 之后实时消息马上就会把 lastseen 往前推（R4）
-      const snapshot = new Map(this.lastseen)
+      const snapshot = this.backfillSnapshot()
       setTimeout(() => this.onReady(snapshot).catch((e) => this.logger.warn('断线补发出错：%s', describeError(e))), 0)
     }))
     ctx.on('message-created', (session) => this.guard(() => this.onQQMessage(session)))
@@ -125,6 +150,10 @@ export class Relay {
     }))
     ctx.on('ready', () => this.start())
     ctx.on('dispose', () => this.dispose())
+    // 重载时适配器里已经有 webhook 缓存：马上认作自己的，防止重载那一刻的回声（A1）
+    for (const wh of Object.values<any>(this.discordBot()?.webhooks ?? {})) {
+      if (wh && typeof wh === 'object' && wh.id) this.sender.ownWebhooks.add(String(wh.id))
+    }
   }
 
   private guard(fn: () => void) {
@@ -141,20 +170,31 @@ export class Relay {
 
   private async doStart() {
     await this.load()
+    this.startedAt = this.now()
     this.resolveLoaded()
     if (this.options.timers !== false) {
       this.ctx.setInterval(() => void this.flushLastseen().catch(() => {}), 10000)
+      this.ctx.setInterval(() => void this.heartbeat().catch(() => {}), ALIVE_INTERVAL)
       this.ctx.setInterval(() => void this.hourly().catch(() => {}), 3600000)
     }
     await this.translation.reload().catch((e) => this.logger.warn('读取关键词、术语表出错：%s', describeError(e)))
     await this.hourly().catch(() => {})
-    // 插件加载时 Discord 机器人已经在线（例如控制台保存后重载）：补一次
+    // 插件启动（重载）时 Discord 机器人已经在线：不补发，lastseen 设成频道最新的消息（A2）
     const bot = this.discordBot()
-    if (bot?.status === Universal.Status.ONLINE && bot.selfId) {
-      await this.onReady(new Map(this.lastseen)).catch((e) => this.logger.warn('断线补发出错：%s', describeError(e)))
-    } else {
-      this.scheduleSelfCheck()
+    if (!this.readyReceived && !this.disposed && bot?.status === Universal.Status.ONLINE && bot.selfId) {
+      await this.prepareWebhooks(bot)
+      for (const channel of this.backfillChannels()) await this.resetLastseen(bot, channel)
     }
+    this.scheduleSelfCheck()
+    await this.heartbeat().catch(() => {})
+  }
+
+  /** 写 alive 心跳（和 lastseen 一起），READY 时用来判断插件停了多久。 */
+  async heartbeat() {
+    await this.loaded
+    if (this.disposed) return
+    await this.flushLastseen()
+    await this.store.set('alive', this.now())
   }
 
   private async load() {
@@ -180,21 +220,38 @@ export class Relay {
       this.logger.warn('读取暂停状态失败，暂时全部暂停：%s', describeError(e))
     }
     try {
+      const wanted = new Set(this.backfillChannels())
       for (const { key, value } of await this.store.entries('lastseen:')) {
         const channel = key.slice('lastseen:'.length)
+        // 不再对应任何启用的 d2q/both 桥：删掉，以后重新启用时从那时开始，不补发
+        if (!wanted.has(channel)) {
+          await this.store.delete(key)
+          this.logger.info(`已清除不再使用的频道 ${channel} 的 lastseen`)
+          continue
+        }
         if (typeof value !== 'string') continue
+        this.persisted.set(channel, value)
+        this.prevRun.add(channel)
         const current = this.lastseen.get(channel)
         if (!current || compareSnowflake(value, current) > 0) this.lastseen.set(channel, value)
       }
     } catch (e) {
       this.logger.warn('读取 lastseen 失败：%s', describeError(e))
     }
+    try {
+      const alive = await this.store.get<number>('alive')
+      if (typeof alive === 'number' && Number.isFinite(alive)) this.loadedAlive = alive
+    } catch {}
   }
 
   async dispose() {
     this.disposed = true
+    this.abort.abort()
     if (this.checkTimer) clearTimeout(this.checkTimer)
-    if (this.starting) await this.flushLastseen().catch(() => {})
+    if (this.starting) {
+      await this.flushLastseen().catch(() => {})
+      await this.store.set('alive', this.now()).catch(() => {})
+    }
   }
 
   private async hourly() {
@@ -327,12 +384,31 @@ export class Relay {
     this.lastseenDirty.clear()
     for (const channel of dirty) {
       const id = this.lastseen.get(channel)
-      if (id) await this.store.set(`lastseen:${channel}`, id)
+      if (!id) continue
+      await this.store.set(`lastseen:${channel}`, id)
+      this.persisted.set(channel, id)
+      this.prevRun.delete(channel)
     }
   }
 
   private isBridgeChannel(channelId: string) {
     return this.settings.bridges.some((b) => b.discord === channelId)
+  }
+
+  /** 需要补发的 Discord 频道（启用的 d2q/both 桥）。 */
+  private backfillChannels() {
+    return [...new Set(this.settings.bridges.filter((b) => b.direction !== 'q2d').map((b) => b.discord))]
+  }
+
+  /** READY 那一刻每个频道的补发起点：优先用数据库里的值（F3）。 */
+  private backfillSnapshot() {
+    const snapshot = new Map<string, { after: string; prevRun: boolean }>()
+    for (const channel of this.backfillChannels()) {
+      const saved = this.persisted.get(channel)
+      const after = saved ?? this.lastseen.get(channel)
+      if (after) snapshot.set(channel, { after, prevRun: !!saved && this.prevRun.has(channel) })
+    }
+    return snapshot
   }
 
   // ---------------------------------------------------------------- Discord → QQ
@@ -348,6 +424,9 @@ export class Relay {
     const bot = this.discordBot()
     if (bot?.selfId && d.author?.id === bot.selfId) return
     if (d.webhook_id && this.sender.ownWebhooks.has(String(d.webhook_id))) return
+    // 适配器缓存的 webhook（重载后新实例的集合里还没有，A1）
+    const cached = bot?.webhooks?.[d.channel_id]?.id
+    if (d.webhook_id && cached && String(cached) === String(d.webhook_id)) return
     if (this.sentIds.has(d.id)) return
     if (!DISCORD_TYPES.has(Number(d.type ?? 0))) return
     // 3. 找桥
@@ -358,17 +437,46 @@ export class Relay {
     if (!active.length) return
     // 5. 在第一个 await 之前占好位置
     const slots = active.map((bridge) => ({ bridge, slot: this.queues.reserve(`onebot:${bridge.qq}`) }))
+    const queuedAt = this.now()
     // 6. 预处理立即开始
-    const prepared = this.limiter.run(() => this.prepareDiscord(d, backfill, active)).catch((e): Prepared => {
+    const prepared = this.limiters.d2q.run(() => this.prepareDiscord(d, backfill, active)).catch((e): Prepared => {
       this.logger.warn('处理 Discord 消息 %s 出错：%s', d.id, describeError(e))
       return { msg: null, skip: '预处理出错', images: [], videos: [], blocked: new Set() }
     })
+    const release = this.releaseAfter(prepared, slots.length)
     for (const { bridge, slot } of slots) {
       void slot.turn
-        .then(() => this.deliverToQQ(bridge, prepared))
+        .then(() => this.tooOld(bridge, 'd2q', queuedAt, d.id) ? undefined : this.deliverToQQ(bridge, prepared))
         .catch((e) => this.logger.warn('转发到 QQ 群 %s 出错：%s', bridge.qq, describeError(e)))
-        .finally(slot.done)
+        .finally(() => {
+          slot.done()
+          release()
+        })
     }
+  }
+
+  /** 所有目标都处理完后丢掉下载好的文件，让内存尽快释放（R9）。 */
+  private releaseAfter(prepared: Promise<Prepared>, count: number) {
+    let left = count
+    return () => {
+      if (--left > 0) return
+      void prepared.then((p) => {
+        p.images = []
+        p.videos = []
+      }, () => {})
+    }
+  }
+
+  /** 成为队首时已经排了超过 maxQueueAgeMinutes：丢掉并写日志（R9）。 */
+  private tooOld(bridge: Bridge, direction: Direction, queuedAt: number, messageId?: string) {
+    if (this.disposed) return true
+    const raw = Number(this.settings.maxQueueAgeMinutes ?? 15)
+    const minutes = Number.isFinite(raw) ? Math.min(1440, Math.max(0, raw)) : 15
+    // 0 = 不限制
+    const waited = this.now() - queuedAt
+    if (!minutes || waited <= minutes * 60000) return false
+    this.fail(bridge, direction, `在队列里等了 ${Math.round(waited / 60000)} 分钟（超过 ${minutes} 分钟），丢弃`, messageId)
+    return true
   }
 
   private async prepareDiscord(d: RawMessage, backfill: boolean, bridges: Bridge[]): Promise<Prepared> {
@@ -405,7 +513,7 @@ export class Relay {
     const videos: Prepared['videos'] = []
     await Promise.all(msg.media.map(async (media, i) => {
       if (media.kind === 'image') {
-        const file = await download(this.ctx, media)
+        const file = await download(this.ctx, media, { signal: this.abort.signal, maxBytes: QQ_IMAGE_LIMIT })
         images[i] = file ? { ...file, placeholder: media.placeholder } : { placeholder: media.placeholder }
       } else if (media.kind === 'video') {
         videos[i] = { url: media.urls[0] ?? '', placeholder: media.placeholder }
@@ -417,6 +525,7 @@ export class Relay {
   }
 
   private async deliverToQQ(bridge: Bridge, preparing: Promise<Prepared>) {
+    if (this.disposed) return
     const head = this.now()
     const deadline = head + HEAD_LIMIT
     const controller = new AbortController()
@@ -427,11 +536,13 @@ export class Relay {
       const msg = prepared.msg
       if (!msg || prepared.skip || prepared.blocked.has(bridge.key)) return
       await this.loaded
-      if (this.isPaused(bridge)) return
+      if (this.isPaused(bridge) || this.disposed) return
       const bot = this.qqBot()
       // @全体（清单 §11）
       let atAll: Awaited<ReturnType<AtAllGate['decide']>> | null = null
       if (bridge.atAll && msg.mentionEveryone && bridge.direction !== 'q2d') {
+        // 已经 dispose：不再做 @全体 决定（A1）
+        if (this.disposed) return
         if (!bot || !qqOnline(bot)) atAll = { ok: false, reason: '查询失败' }
         else atAll = await this.gate.decide(bot, bridge.qq, msg)
         // 在发送之前就记下次数；已经超时或记不下来时改发文字
@@ -475,6 +586,10 @@ export class Relay {
       let part = 0
       let failure = ''
       for (let i = 0; i < sends.length; i++) {
+        if (this.disposed) {
+          if (i === 0 && atAll?.ok) await atAll.revert().catch(() => {})
+          break
+        }
         if (this.now() >= deadline) {
           if (i === 0 && atAll?.ok) await atAll.revert().catch(() => {})
           failure = '超过 60 秒，后面的分段没有发出'
@@ -560,15 +675,20 @@ export class Relay {
     const active = bridges.filter((b) => !this.isPaused(b))
     if (!active.length) return
     const slots = active.map((bridge) => ({ bridge, slot: this.queues.reserve(`discord:${bridge.discord}`) }))
-    const prepared = this.limiter.run(() => this.prepareQQ(session, active)).catch((e): Prepared => {
+    const queuedAt = this.now()
+    const prepared = this.limiters.q2d.run(() => this.prepareQQ(session, active)).catch((e): Prepared => {
       this.logger.warn('处理 QQ 消息 %s 出错：%s', session.messageId, describeError(e))
       return { msg: null, skip: '预处理出错', images: [], videos: [], blocked: new Set() }
     })
+    const release = this.releaseAfter(prepared, slots.length)
     for (const { bridge, slot } of slots) {
       void slot.turn
-        .then(() => this.deliverToDiscord(bridge, prepared))
+        .then(() => this.tooOld(bridge, 'q2d', queuedAt, session.messageId) ? undefined : this.deliverToDiscord(bridge, prepared))
         .catch((e) => this.logger.warn('转发到 Discord 频道 %s 出错：%s', bridge.discord, describeError(e)))
-        .finally(slot.done)
+        .finally(() => {
+          slot.done()
+          release()
+        })
     }
   }
 
@@ -576,10 +696,11 @@ export class Relay {
     const bot = this.qqBot()
     const names = new Map<string, string>()
     const ids = [...collectAtIds(session.elements ?? []), ...collectAtIds(session.quote?.elements ?? [])]
-    for (const id of new Set(ids)) {
+    // 并行查，每个最多 5 秒（R8）
+    await Promise.all([...new Set(ids)].map(async (id) => {
       const name = await this.memberName(bot, session.channelId!, id)
       if (name) names.set(id, name)
-    }
+    }))
     const msg = parseQQMessage(session, { selfId: session.selfId, memberName: (id) => names.get(id), now: this.now() })
     const blocked = new Set<string>()
     for (const bridge of bridges) {
@@ -590,13 +711,14 @@ export class Relay {
     const images: Prepared['images'] = []
     await Promise.all(msg.media.map(async (media, i) => {
       const limit = media.kind === 'video' ? QQ_VIDEO_LIMIT : DISCORD_FILE_LIMIT
-      const file = media.urls.length ? await download(this.ctx, media, { maxBytes: limit }) : null
+      const file = media.urls.length ? await download(this.ctx, media, { signal: this.abort.signal, maxBytes: limit }) : null
       images[i] = file ? { ...file, placeholder: media.placeholder } : { placeholder: media.placeholder }
     }))
     return { msg, images: images.filter(Boolean), videos: [], blocked, translation }
   }
 
   private async deliverToDiscord(bridge: Bridge, preparing: Promise<Prepared>) {
+    if (this.disposed) return
     const head = this.now()
     const deadline = head + HEAD_LIMIT
     const controller = new AbortController()
@@ -607,7 +729,7 @@ export class Relay {
       const msg = prepared.msg
       if (!msg || prepared.skip || prepared.blocked.has(bridge.key)) return
       await this.loaded
-      if (this.isPaused(bridge)) return
+      if (this.isPaused(bridge) || this.disposed) return
       const bot = this.discordBot()
       if (!bot) return this.fail(bridge, 'q2d', this.botProblem('discord') ?? '没有 Discord 机器人')
       const limit = () => Math.max(0, Math.min(15000, deadline - this.now()))
@@ -652,16 +774,17 @@ export class Relay {
       if (!contents.length && !files.length) return 'done'
       if (!contents.length) contents.push('')
       const username = webhook ? webhookUsername(bridge.label, msg.author) : undefined
-      // 文件跟着最后一段；一次最多 10 个，多的另起一次发送
+      // 文件跟着最后一段；一次最多 10 个、总共不超过 24 MiB，多的另起一次发送
       const batches: Array<{ content: string; files: typeof files }> = contents.map((content) => ({ content, files: [] }))
-      for (let i = 0; i < files.length; i += 10) {
-        const chunk = files.slice(i, i + 10)
+      fileBatches(files).forEach((chunk, i) => {
         if (i === 0) batches[batches.length - 1].files = chunk
         else batches.push({ content: '', files: chunk })
-      }
+      })
       let part = 0
       let failure = ''
       for (let i = 0; i < batches.length; i++) {
+        // 已经 dispose：不再发起新的发送（已发出的请求不中止）
+        if (this.disposed) break
         if (this.now() >= deadline) {
           failure = '超过 60 秒，后面的分段没有发出'
           break
@@ -780,55 +903,92 @@ export class Relay {
     const key = `${groupId}:${userId}`
     const cached = this.memberNames.get(key)
     if (cached !== undefined) return cached || undefined
-    try {
-      const member = await bot?.getGuildMember(groupId, userId)
-      const name = member?.nick || member?.user?.name || ''
-      this.memberNames.set(key, name)
-      return name || undefined
-    } catch {
-      this.memberNames.set(key, '')
+    // 刚刚查询超时过：短时间内不再查，直接用 QQ 号
+    if (this.memberSlow.get(key)) return undefined
+    const lookup = Promise.resolve()
+      .then(() => bot?.getGuildMember(groupId, userId))
+      .then((member: any) => {
+        const name = member?.nick || member?.user?.name || ''
+        this.memberNames.set(key, name)
+        return name as string
+      }, () => {
+        this.memberNames.set(key, '')
+        return ''
+      })
+    const name = await timed(lookup, MEMBER_TIMEOUT, undefined)
+    if (name === undefined) {
+      this.memberSlow.set(key, true)
       return undefined
     }
+    return name || undefined
   }
 
   // ---------------------------------------------------------------- 断线补发（清单 §15）
 
-  private async onReady(snapshot: Map<string, string>) {
+  private async onReady(snapshot: Map<string, { after: string; prevRun: boolean }>) {
     await this.loaded
     const bot = this.discordBot()
-    if (!bot) return
-    // 自己的 webhook 集合（§6.3）
-    if (this.settings.discordAsWebhook) {
-      for (const channel of new Set(this.settings.bridges.filter((b) => b.direction !== 'd2q').map((b) => b.discord))) {
-        await this.sender.ensureWebhook(bot, channel).catch(() => {})
-      }
-    }
-    const channels = [...new Set(this.settings.bridges.filter((b) => b.direction !== 'q2d').map((b) => b.discord))]
-    for (const channel of channels) {
-      const after = snapshot.get(channel) ?? this.lastseen.get(channel)
-      if (!after) {
+    if (!bot || this.disposed) return
+    await this.prepareWebhooks(bot)
+    // 插件停了多久：上一次运行最后的 alive 到这次启动（没有记录按「太久」处理）
+    const downtime = this.loadedAlive === undefined ? Infinity : this.startedAt - this.loadedAlive
+    for (const channel of this.backfillChannels()) {
+      if (this.disposed) return
+      // READY 比读完数据库还早时快照是空的，这时再取一次
+      const point = snapshot.get(channel) ?? this.backfillSnapshot().get(channel)
+      if (!point) {
         // 没有记录：不补发，从现在开始（DECISIONS 第 10 条）
         await this.initLastseen(bot, channel)
         continue
       }
-      await this.backfill(bot, channel, after).catch((e) => this.logger.warn(`频道 ${channel} 补发失败：${describeError(e)}`))
+      if (point.prevRun && downtime > ALIVE_STALE) {
+        // 起点是插件停止之前留下的，而且停了超过 15 分钟：不补发，只重置
+        this.logger.info(`频道 ${channel}：插件停止超过 15 分钟，不补发，从现在开始`)
+        await this.resetLastseen(bot, channel)
+        continue
+      }
+      await this.backfill(bot, channel, point.after).catch((e) => this.logger.warn(`频道 ${channel} 补发失败：${describeError(e)}`))
     }
     this.scheduleSelfCheck()
   }
 
+  /** 自己的 webhook 集合（§6.3）。 */
+  private async prepareWebhooks(bot: any) {
+    if (!this.settings.discordAsWebhook) return
+    for (const channel of new Set(this.settings.bridges.filter((b) => b.direction !== 'd2q').map((b) => b.discord))) {
+      await this.sender.ensureWebhook(bot, channel).catch(() => {})
+    }
+  }
+
+  /** 频道最新一条消息的 ID；取不到时用现在的时间。 */
+  private async latestId(bot: any, channel: string) {
+    const raw = await timed<any, undefined>(bot?.internal?.getChannel(channel), 10000, undefined)
+    return (raw?.last_message_id as string | undefined) || snowflakeFromTime(this.now())
+  }
+
   private async initLastseen(bot: any, channel: string) {
-    let id: string | undefined
-    try {
-      id = (await bot.internal.getChannel(channel))?.last_message_id ?? undefined
-    } catch {}
+    const id = await this.latestId(bot, channel)
     const current = this.lastseen.get(channel)
     if (current) return
-    this.lastseen.set(channel, id || snowflakeFromTime(this.now()))
+    this.lastseen.set(channel, id)
     this.lastseenDirty.add(channel)
     await this.flushLastseen().catch(() => {})
   }
 
+  /** 不补发：lastseen 直接设成频道最新的消息（A2）。 */
+  private async resetLastseen(bot: any, channel: string) {
+    const id = await this.latestId(bot, channel)
+    const current = this.lastseen.get(channel)
+    // 期间实时消息推得更高（且不是上次运行留下的）就用那个
+    if (current && !this.prevRun.has(channel) && compareSnowflake(current, id) > 0) this.lastseen.set(channel, current)
+    else this.lastseen.set(channel, id)
+    this.lastseenDirty.add(channel)
+    this.prevRun.delete(channel)
+    await this.flushLastseen().catch(() => {})
+  }
+
   async backfill(bot: any, channel: string, after: string) {
+    if (this.disposed) return 0
     const lower = snowflakeFromTime(this.now() - BACKFILL_WINDOW)
     let cursor = compareSnowflake(after, lower) > 0 ? after : lower
     const collected: RawMessage[] = []
@@ -848,6 +1008,7 @@ export class Relay {
       if (more || page.length < 100) break
     }
     if (more) this.logger.warn(`频道 ${channel} 断线期间的消息超过 ${BACKFILL_MAX} 条，只补发了最早的 ${BACKFILL_MAX} 条`)
+    if (this.disposed) return 0
     for (const message of collected) {
       this.onDiscordMessage({ ...message, channel_id: message.channel_id ?? channel }, true)
     }
@@ -915,6 +1076,25 @@ function timed<T, F>(promise: Promise<T> | undefined, ms: number, fallback: F): 
     const timer = setTimeout(() => resolve(fallback), ms)
     promise.then((value) => resolve(value), () => resolve(fallback)).finally(() => clearTimeout(timer))
   })
+}
+
+/** 按顺序把文件分批：每批最多 10 个、总大小不超过 24 MiB（A5）。 */
+export function fileBatches<T extends { data: ArrayBuffer }>(files: T[]): T[][] {
+  const batches: T[][] = []
+  let current: T[] = []
+  let bytes = 0
+  for (const file of files) {
+    const size = file.data.byteLength
+    if (current.length && (current.length >= DISCORD_BATCH_FILES || bytes + size > DISCORD_BATCH_BYTES)) {
+      batches.push(current)
+      current = []
+      bytes = 0
+    }
+    current.push(file)
+    bytes += size
+  }
+  if (current.length) batches.push(current)
+  return batches
 }
 
 function sleepUntil(deadline: number, now: () => number) {

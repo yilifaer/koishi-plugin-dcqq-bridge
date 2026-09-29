@@ -392,3 +392,34 @@ export async function setup(patch: Partial<Config> = {}, options: { online?: boo
 export function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
+
+// ------------------------------------------------------------------ PR A 追加的小工具
+
+/** 和 setup() 默认值一样的完整配置。 */
+export function baseConfig(patch: Partial<Config> = {}): Config {
+  return {
+    discordSelfId: '', qqSelfId: '', timezone: 'Asia/Shanghai', discordAsWebhook: true, keepDays: 7, authority: 4, qqReorderMs: 0,
+    maxQueueAgeMinutes: 15,
+    bridges: [bridge()],
+    atAll: { fallbackText: '【全体通知】', reserve: 0, dailyCap: 0, cooldownMinutes: 0, maxAgeMinutes: 10 },
+    ...PR2_DEFAULTS,
+    ...patch,
+  }
+}
+
+/** 模拟插件重载：在一个新的插件里装一个新的 Relay（和正式环境一样 install + start），返回它和卸载函数。 */
+export async function installRelay(env: Env, config: Config): Promise<{ relay: Relay; dispose: () => void }> {
+  let relay: Relay | undefined
+  const fork = env.app.plugin({
+    name: 'dcqq-bridge-reload',
+    inject: ['database', 'http'],
+    apply(ctx: Context) {
+      relay = new Relay(ctx, config, { timers: false, now: () => env.clock.now, sleep: (ms) => new Promise((r) => setTimeout(r, Math.min(ms, 50))) })
+      relay.install()
+    },
+  })
+  for (let i = 0; i < 100 && !relay; i++) await sleep(10)
+  if (!relay) throw new Error('新的 Relay 没有装上')
+  await relay.start()
+  return { relay, dispose: () => void fork.dispose() }
+}

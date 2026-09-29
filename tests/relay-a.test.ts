@@ -588,7 +588,7 @@ describe('B7 失败处理和分段', () => {
     expect(env.relay.stats.get(`${DC_CHANNEL}:${QQ_GROUP}`).forwards).toBe(2)
   })
 
-  it('413 → 去掉最大的文件、加占位文字，重发一次', async () => {
+  it('413 → 这一批的文件全部换成占位文字，重发一次', async () => {
     media = await startMedia({ '/small.png': { size: 500 }, '/big.png': { size: 5000 } })
     env = await setup()
     env.discord.fault('POST', /^\/webhooks\//, { status: 413, body: { message: 'Request entity too large', code: 40005 } })
@@ -601,9 +601,8 @@ describe('B7 失败处理和分段', () => {
     const posts = env.discord.posts()
     expect(posts).toHaveLength(2)
     expect(posts[0].files).toHaveLength(2)
-    expect(posts[1].files).toHaveLength(1)
-    expect(posts[1].files[0].size).toBe(500)
-    expect(posts[1].json.content).toMatch(/^两张\n\\?\[图片\\?\]$/)
+    expect(posts[1].files).toHaveLength(0)
+    expect(posts[1].json.content).toMatch(/^两张\n\\?\[图片\\?\]\n\\?\[图片\\?\]$/)
   })
 
   it('413 重发时加上占位文字后 content 仍不超过 2000', async () => {
@@ -619,7 +618,7 @@ describe('B7 失败处理和分段', () => {
     const posts = env.discord.posts()
     expect(posts).toHaveLength(2)
     expect(posts[0].json.content.length).toBeLessThanOrEqual(2000)
-    expect(posts[1].files).toHaveLength(1)
+    expect(posts[1].files).toHaveLength(0)
     expect(posts[1].json.content.length).toBeLessThanOrEqual(2000)
     expect(posts[1].json.content).toContain('[图片')
   })
