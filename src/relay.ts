@@ -16,6 +16,7 @@ import { collectAtIds, parseQQMessage } from './qq/parse'
 import { qqOnline, sendQQ } from './qq/api'
 import { MessageRow, Store } from './store'
 import { Stats } from './stats'
+import { TranslationOutcome, TranslationService } from './translate/service'
 import { deletedReplyLine, prefixFor, replyLine, stripOwnDecorations } from './text/reply'
 import type { FileData, Msg } from './types'
 import { compareSnowflake, dateIn, Limiter, OrderedQueues, SeenSet, snowflakeFromTime, TtlCache } from './util'
@@ -43,6 +44,8 @@ interface Prepared {
   videos: Array<{ url: string; placeholder: string; file?: FileData }>
   /** 被屏蔽的桥。 */
   blocked: Set<string>
+  /** 这条消息的翻译（同一条消息、同一个方向只翻一次，多个目标共用）。 */
+  translation?: Promise<TranslationOutcome>
 }
 
 type Direction = 'd2q' | 'q2d'
@@ -57,6 +60,9 @@ export class Relay {
   now: () => number
   /** 暂停状态：`global`、`<discord>:<qq>`。 */
   paused = new Set<string>()
+  /** 只暂停翻译：`global`、`<discord>:<qq>`。 */
+  pausedTr = new Set<string>()
+  translation: TranslationService
   /** 自检发现的问题：桥 key → 问题。 */
   health = new Map<string, string[]>()
   private queues = new OrderedQueues()
@@ -87,6 +93,7 @@ export class Relay {
     this.sender = new DiscordSender(this.logger)
     this.dateOf = dateIn(this.settings.timeZone)
     this.gate = new AtAllGate(this.store, () => this.settings.atAll, this.dateOf, this.now)
+    this.translation = new TranslationService(ctx, () => this.settings, this.logger, this.now)
     for (const problem of this.settings.problems) this.logger.warn(problem)
     for (const row of this.settings.rows) {
       if (row.invalid) this.logger.warn(`第 ${row.index} 行桥无效，已跳过：${row.invalid}`)
@@ -133,6 +140,7 @@ export class Relay {
       this.ctx.setInterval(() => void this.hourly().catch(() => {}), 3600000)
     }
     await this.hourly().catch(() => {})
+    await this.translation.reload().catch((e) => this.logger.warn('读取关键词、术语表出错：%s', describeError(e)))
     // 插件加载时 Discord 机器人已经在线（例如控制台保存后重载）：补一次
     const bot = this.discordBot()
     if (bot?.status === Universal.Status.ONLINE && bot.selfId) {
@@ -149,7 +157,7 @@ export class Relay {
         const pair = rest.join(':')
         if (kind !== 'pause' && kind !== 'pausetr') continue
         if (pair === 'global') {
-          if (kind === 'pause') this.paused.add('global')
+          ;(kind === 'pause' ? this.paused : this.pausedTr).add('global')
           continue
         }
         if (!this.settings.allKeys.has(pair)) {
@@ -157,7 +165,7 @@ export class Relay {
           this.logger.info(`已清除指向不存在的桥的暂停状态：${pair}`)
           continue
         }
-        if (kind === 'pause') this.paused.add(pair)
+        ;(kind === 'pause' ? this.paused : this.pausedTr).add(pair)
       }
     } catch (e) {
       // 读不到暂停状态时按「全局暂停」处理，宁可不转发
@@ -247,14 +255,50 @@ export class Relay {
     return this.paused.has('global') || (!!bridge && this.paused.has(bridge.key))
   }
 
-  async setPaused(key: 'global' | string, paused: boolean) {
+  async setPaused(key: 'global' | string, paused: boolean, translationOnly = false) {
+    const set = translationOnly ? this.pausedTr : this.paused
+    const stateKey = `${translationOnly ? 'pausetr' : 'pause'}:${key}`
     if (paused) {
-      this.paused.add(key)
-      await this.store.set(`pause:${key}`, true)
+      set.add(key)
+      await this.store.set(stateKey, true)
     } else {
-      this.paused.delete(key)
-      await this.store.delete(`pause:${key}`)
+      set.delete(key)
+      await this.store.delete(stateKey)
     }
+  }
+
+  isTranslationPaused(bridge?: Bridge) {
+    return this.pausedTr.has('global') || (!!bridge && this.pausedTr.has(bridge.key))
+  }
+
+  /** 这个桥现在要不要附译文（清单 §12.1 第 1 步）。 */
+  needsTranslation(bridge: Bridge) {
+    return this.settings.translate.enabled && bridge.translate && !this.isTranslationPaused(bridge)
+  }
+
+  /** 等这条消息的译文：最多 timeoutMs + 3 秒审核（清单 §6.2 第 7 步），超时就用原文。 */
+  private async waitTranslation(bridge: Bridge, prepared: Prepared, deadline: number): Promise<string | undefined> {
+    if (!prepared.translation || !this.needsTranslation(bridge)) return undefined
+    const limit = Math.min(this.settings.translate.timeoutMs + 3500, Math.max(0, deadline - this.now() - 5000))
+    const outcome = await timed(prepared.translation, limit, null)
+    if (!outcome) {
+      this.stats.translation(bridge.key, false, '等待超时')
+      return undefined
+    }
+    if (outcome.ok) {
+      this.stats.translation(bridge.key, true)
+      return `${this.settings.translate.label} ${outcome.text}`
+    }
+    if (!outcome.skipped) this.stats.translation(bridge.key, false, outcome.reason)
+    return undefined
+  }
+
+  private startTranslation(msg: Msg, bridges: Bridge[], blocked: Set<string>, direction: 'en2zh' | 'zh2en') {
+    if (!bridges.some((b) => !blocked.has(b.key) && this.needsTranslation(b))) return undefined
+    return this.translation.translate(msg, direction).catch((e): TranslationOutcome => {
+      this.logger.warn('翻译出错：%s', describeError(e))
+      return { ok: false, reason: '翻译出错', skipped: false }
+    })
   }
 
   // ---------------------------------------------------------------- lastseen
@@ -345,6 +389,7 @@ export class Relay {
       if (bridge.blockWords.some((re) => re.test(msg.checkText))) blocked.add(bridge.key)
     }
     if (blocked.size === bridges.length) return { msg, skip: '命中屏蔽词', images: [], videos: [], blocked }
+    const translation = this.startTranslation(msg, bridges, blocked, 'en2zh')
     const images: Prepared['images'] = []
     const videos: Prepared['videos'] = []
     await Promise.all(msg.media.map(async (media, i) => {
@@ -357,7 +402,7 @@ export class Relay {
         images[i] = { placeholder: media.placeholder }
       }
     }))
-    return { msg, images: images.filter(Boolean), videos: videos.filter(Boolean), blocked }
+    return { msg, images: images.filter(Boolean), videos: videos.filter(Boolean), blocked, translation }
   }
 
   private async deliverToQQ(bridge: Bridge, preparing: Promise<Prepared>) {
@@ -400,6 +445,7 @@ export class Relay {
         if (found.targetId) quoteId = found.targetId
         else line = this.replyText(msg, found.forwardedFrom)
       }
+      const translated = await this.waitTranslation(bridge, prepared, deadline)
       const sends = buildQQSends({
         quoteId,
         atAll: !!atAll?.ok,
@@ -407,6 +453,7 @@ export class Relay {
         prefix: prefixFor(bridge.label, msg.author, msg.backfill),
         replyLine: line,
         text: fullText(msg),
+        translation: translated,
         images: prepared.images.map((image) => ('data' in image ? { data: image.data, mime: image.mime } : { placeholder: image.placeholder })),
         videos: prepared.videos.map((video) => ({ url: video.url, placeholder: video.placeholder })),
       })
@@ -528,13 +575,14 @@ export class Relay {
       if (bridge.blockWords.some((re) => re.test(msg.checkText))) blocked.add(bridge.key)
     }
     if (blocked.size === bridges.length) return { msg, skip: '命中屏蔽词', images: [], videos: [], blocked }
+    const translation = this.startTranslation(msg, bridges, blocked, 'zh2en')
     const images: Prepared['images'] = []
     await Promise.all(msg.media.map(async (media, i) => {
       const limit = media.kind === 'video' ? QQ_VIDEO_LIMIT : DISCORD_FILE_LIMIT
       const file = media.urls.length ? await download(this.ctx, media, { maxBytes: limit }) : null
       images[i] = file ? { ...file, placeholder: media.placeholder } : { placeholder: media.placeholder }
     }))
-    return { msg, images: images.filter(Boolean), videos: [], blocked }
+    return { msg, images: images.filter(Boolean), videos: [], blocked, translation }
   }
 
   private async deliverToDiscord(bridge: Bridge, preparing: Promise<Prepared>) {
@@ -556,11 +604,12 @@ export class Relay {
       let webhook: Webhook | null = this.settings.discordAsWebhook ? await timed(this.sender.tryWebhook(bot, bridge.discord), limit(), null) : null
       const found = msg.reply ? await this.findReplyTarget(msg.channelId, msg.reply.messageId, bridge.discord) : {}
       const link = found.targetId ? await timed(this.messageLink(bot, bridge.discord, found.targetId), limit(), undefined) : undefined
-      let result = await this.sendToDiscord(bot, bridge, msg, prepared, webhook, found, link, deadline, controller.signal)
+      const translated = await this.waitTranslation(bridge, prepared, deadline)
+      let result = await this.sendToDiscord(bot, bridge, msg, prepared, webhook, found, link, deadline, controller.signal, translated)
       // webhook 失效又重建不了：改由机器人发（DECISIONS 第 9 条）
       if (result === 'webhookGone') {
         webhook = null
-        result = await this.sendToDiscord(bot, bridge, msg, prepared, null, found, link, deadline, controller.signal)
+        result = await this.sendToDiscord(bot, bridge, msg, prepared, null, found, link, deadline, controller.signal, translated)
       }
     } finally {
       clearTimeout(timer)
@@ -570,6 +619,7 @@ export class Relay {
   private async sendToDiscord(
     bot: any, bridge: Bridge, msg: Msg, prepared: Prepared, webhook: Webhook | null,
     found: { targetId?: string; forwardedFrom?: MessageRow }, link: string | undefined, deadline: number, signal: AbortSignal,
+    translated?: string,
   ): Promise<'done' | 'webhookGone'> {
     {
       // 回复（清单 §9）
@@ -585,7 +635,8 @@ export class Relay {
       const contents = buildDiscordContents({
         prefix: webhook ? '' : prefixFor(bridge.label, msg.author, false),
         replyLine: line,
-        text: [fullText(msg), ...placeholders].filter(Boolean).join('\n'),
+        // 顺序：渲染 → 附加译文 → 转义 → 加前缀 → 切分（清单 §8.3）
+        text: [[fullText(msg), translated].filter(Boolean).join('\n\n'), ...placeholders].filter(Boolean).join('\n'),
       })
       if (!contents.length && !files.length) return 'done'
       if (!contents.length) contents.push('')
