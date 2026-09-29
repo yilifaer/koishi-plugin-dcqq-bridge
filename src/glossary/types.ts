@@ -43,7 +43,7 @@ export interface GlossarySources {
 export interface GlossaryApplication {
   /** force、keep 的词换成 ⟦G0⟧、⟦G1⟧…（每一处单独编号） */
   text: string
-  /** 还原用：force → 目标语言的标准写法（已按 systemStyle），keep → 原文 */
+  /** 还原用：目标语言的标准写法（force 已按 systemStyle；keep 英文原文带复数 s 时补 s） */
   tokens: Array<{ token: string; value: string }>
   /** `EN => 中文`，去重，最多 30 行，按出现顺序 */
   hints: string[]

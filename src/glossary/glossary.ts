@@ -134,7 +134,10 @@ export class Glossary {
         continue
       }
       const token = `⟦G${tokens.length}⟧`
-      tokens.push({ token, value: cand.mode === 'keep' ? text.slice(start, end) : cand.value })
+      // keep 也还原成标准写法；英文标准写法且原文带复数 s 时补回 s（审查 B1）
+      let value = cand.value
+      if (cand.mode === 'keep' && end - start > cand.term.length && /[A-Za-z]$/.test(value)) value += 's'
+      tokens.push({ token, value })
       out += text.slice(last, start) + token
       last = end
     }
@@ -257,7 +260,10 @@ export function buildGlossary(options: GlossaryOptions, sources: GlossarySources
       const hint = `${en} => ${zh}`
       let used = false
       if (charLength(en) >= MIN_LENGTH) {
-        const common = sources.commonWords.has(en.toLowerCase())
+        // 地名：每个词都是常用词、或以 The 开头，也按常用词处理（审查 B2）
+        const common = place
+          ? /^the\s/i.test(en) || en.toLowerCase().split(/[\s-]+/).every((w) => sources.commonWords.has(w))
+          : sources.commonWords.has(en.toLowerCase())
         const mode: GlossaryMode = common || letterCount(en) <= 3 ? 'hint' : 'force'
         const value = place ? placeValue(en, zh, options.systemStyle) : zh
         terms.en2zh.push({ source: en, mode, value, hint, priority, english: true, common })

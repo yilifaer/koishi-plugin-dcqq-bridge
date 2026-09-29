@@ -41,6 +41,10 @@ export interface TranslateConfig {
   label: string
   timeoutMs: number
   maxPerHour: number
+  /** JSON 对象字符串，合并进请求体（B7）。 */
+  extraBody: string
+  /** 不算命令的词，;; 分隔（B9）。 */
+  notCommands: string
 }
 
 export interface FilterConfig {
@@ -143,13 +147,17 @@ export const Config: Schema<Config> = Schema.intersect([
       apiKey: Schema.string().role('secret').default('').loose()
         .description('API key。只填在这里，不要发给任何人。'),
       model: str()
-        .description('模型名，例如 `gpt-4o-mini`、`deepseek-chat`。'),
+        .description('模型名。推荐不带推理（思考）的模型，例如 `gpt-4.1-mini`、`gpt-4o-mini`、`deepseek-chat`；推理模型慢，容易超时。'),
       label: str('【机翻】')
         .description('译文前的标注，不能为空（为空时自动用「【机翻】」）。'),
       timeoutMs: num(6000)
         .description('翻译请求最多等多少毫秒，超过就只发原文。'),
       maxPerHour: num(0)
         .description('每小时最多请求几次，0 = 不限。超过就只发原文。'),
+      extraBody: Schema.string().role('textarea').default('').loose()
+        .description('可选：额外合并进请求体的字段，写成 JSON 对象，例如 `{"max_tokens": 1000}`。不能覆盖 `model` 和 `messages`。写错时忽略，并在 `bridge.status` 里提示。'),
+      notCommands: str('help')
+        .description('这些词开头的消息不当作命令（照常翻译），多个用 `;;` 分隔，不区分大小写。只有第一个词是命令、并且整条消息不超过 3 个词时才当作命令不翻译。'),
     }).default({} as TranslateConfig).loose(),
   }).description('翻译'),
 
@@ -164,7 +172,7 @@ export const Config: Schema<Config> = Schema.intersect([
       moderationBaseURL: str('https://api.openai.com/v1')
         .description('审核接口地址（只有 OpenAI 提供这个接口）。'),
       moderationApiKey: Schema.string().role('secret').default('').loose()
-        .description('审核接口的 key。留空时，只有当翻译接口和审核接口是同一个网站时才借用翻译的 key；否则必须填，插件绝不会把别家的 key 发给 OpenAI。'),
+        .description('审核接口的 key。留空时，只有当翻译接口地址和审核接口地址完全相同（协议、主机、端口、路径）时才借用翻译的 key；否则必须填，插件绝不会把别家的 key 发给 OpenAI。'),
     }).default({} as FilterConfig).loose(),
   }).description('过滤'),
 

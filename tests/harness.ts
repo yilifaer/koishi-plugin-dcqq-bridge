@@ -242,7 +242,7 @@ export interface Env {
 
 /** PR 2 新增的配置项的默认值（全部关闭）。 */
 export const PR2_DEFAULTS: Pick<Config, 'translate' | 'filter' | 'glossary'> = {
-  translate: { enabled: false, baseURL: '', apiKey: '', model: '', label: '【机翻】', timeoutMs: 6000, maxPerHour: 0 },
+  translate: { enabled: false, baseURL: '', apiKey: '', model: '', label: '【机翻】', timeoutMs: 6000, maxPerHour: 0, extraBody: '', notCommands: 'help' },
   filter: { keywords: '', keywordFile: '', moderation: false, moderationBaseURL: 'https://api.openai.com/v1', moderationApiKey: '' },
   glossary: { eve: false, systemStyle: 'en(zh)', slangFile: '', overrides: [] },
 }

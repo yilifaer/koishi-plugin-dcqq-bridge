@@ -358,7 +358,8 @@ export class Relay {
   }
 
   private startTranslation(msg: Msg, bridges: Bridge[], blocked: Set<string>, direction: 'en2zh' | 'zh2en') {
-    if (!this.settings.translate.enabled || !bridges.some((b) => !blocked.has(b.key) && b.translate)) return undefined
+    // 补发的消息不翻译（B4）
+    if (msg.backfill || !this.settings.translate.enabled || !bridges.some((b) => !blocked.has(b.key) && b.translate)) return undefined
     // 暂停状态读完之后再判断（插件刚加载时 pausetr 还没读进来）
     return this.loaded.then(() => {
       if (!bridges.some((b) => !blocked.has(b.key) && this.needsTranslation(b))) return { ok: false, reason: '翻译暂停', skipped: true } as TranslationOutcome

@@ -101,10 +101,12 @@ A [Koishi](https://koishi.chat/) plugin that bridges **Discord channels** and **
 | `enabled` | 关 | 总开关 |
 | `baseURL` | 空 | OpenAI 兼容接口的地址（见下表） |
 | `apiKey` | 空 | API key |
-| `model` | 空 | 模型名 |
+| `model` | 空 | 模型名。推荐不带推理（思考）的模型，例如 `gpt-4.1-mini`、`gpt-4o-mini` |
 | `label` | `【机翻】` | 译文前的标注。不能为空，为空时自动用「【机翻】」 |
 | `timeoutMs` | `6000` | 翻译请求最多等多少毫秒，超过就只发原文 |
 | `maxPerHour` | `0` | 每小时最多请求几次，`0` = 不限 |
+| `extraBody` | 空 | 可选：额外合并进请求体的字段，写成 JSON 对象（见下） |
+| `notCommands` | `help` | 这些词开头的消息不当作命令，照常翻译；多个用 `;;` 分隔，不区分大小写 |
 
 总开关打开但没填 `baseURL` 或 `model` 时，翻译按关闭处理，`bridge.status` 会显示原因。
 
@@ -112,17 +114,26 @@ A [Koishi](https://koishi.chat/) plugin that bridges **Discord channels** and **
 
 | 服务商 | `baseURL` | `model` 例子 |
 |---|---|---|
-| OpenAI | `https://api.openai.com/v1` | `gpt-4o-mini` |
+| OpenAI | `https://api.openai.com/v1` | `gpt-4.1-mini`、`gpt-4o-mini` |
 | DeepSeek | `https://api.deepseek.com/v1` | `deepseek-chat` |
 | 通义千问 | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen-plus` |
+
+**模型选择**：聊天转发要的是快，推荐不带推理（思考）的模型，例如 `gpt-4.1-mini`、`gpt-4o-mini`。o 系列、R1 这类推理模型要先「想」一阵才出译文，常常超过 `timeoutMs`，结果只发原文。
+
+**`extraBody`**：服务商需要额外参数时用，写成一个 JSON 对象，原样合并进请求体，例如 `{"max_tokens": 1000}`。`model` 和 `messages` 由插件决定，写了也会被忽略。JSON 写错或不是对象（例如数组）时整项忽略，并在 `bridge.status` 里提示。
+
+同时进行的翻译请求最多 4 个，其余排队；排队的时间也算在 `timeoutMs` 里，等不到就按超时处理（不发请求），只发原文。
 
 必须用服务商的 **API key**。Claude、ChatGPT 这类聊天订阅不能拿来当机器人的后端。
 
 **哪些不翻译**：
 - 太短的（例如 `gg`、`@张三 ok`）；
 - 已经是目标语言的；
-- Koishi 命令（例如查价命令）；
-- 命中关键词的。
+- Koishi 命令（例如查价命令）：第一个词（去掉命令前缀后）是本机的命令、不在 `notCommands` 里，并且整条消息按空格分不超过 3 段。所以 `jita plex` 不翻译，`Help needed in Jita, we are tackled` 照常翻译；
+- 命中关键词的；
+- 去掉网址、提及、术语等之后没有文字的（只有术语时，能直接换成目标语言的术语就本地生成译文，不请求服务商）；
+- 译文和原文一样的（不区分大小写和空白）不附；
+- 断线后补发的消息。
 
 **不会发给翻译服务商的内容**：用户名、QQ 号、群号、频道名、文件名。提及、网址、时间、代号星系、ISK 数字会先换成占位符，翻译后再换回来。
 
@@ -134,7 +145,7 @@ A [Koishi](https://koishi.chat/) plugin that bridges **Discord channels** and **
 | `keywordFile` | 空 | 可选的关键词文件（相对 Koishi 实例目录），格式同上，`#` 开头是注释 |
 | `moderation` | 关 | 用 OpenAI 审核接口检查译文 |
 | `moderationBaseURL` | `https://api.openai.com/v1` | 审核接口地址 |
-| `moderationApiKey` | 空 | 审核接口的 key。留空时，只有翻译接口也是同一个网站才借用翻译的 key；插件绝不会把别家的 key 发给 OpenAI |
+| `moderationApiKey` | 空 | 审核接口的 key。留空时，只有翻译接口地址和审核接口地址完全相同（协议、主机、端口、路径，末尾的 `/` 不算）才借用翻译的 key；插件绝不会把别家的 key 发给 OpenAI |
 
 - 原文命中关键词：不翻译；译文命中关键词：不附译文。原文照常转发。
 - 英文关键词建议写成 `re:\bword\b`，否则 `ass` 会命中 `class`。

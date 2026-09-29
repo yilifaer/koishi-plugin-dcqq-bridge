@@ -18,11 +18,15 @@ export function skipReason(stripped: string, direction: 'en2zh' | 'zh2en'): stri
 }
 
 /**
- * 原文是不是 Koishi 命令：取第一个空白分隔的词，有配置前缀时去掉一个（'/' 只有配置了才去掉），
- * resolve(词) 有结果就算（调用方传 ctx.$commander.resolve，不带 session，禁用的别名也算）。
+ * 原文是不是 Koishi 命令（B9，两条都满足才算）：
+ * 1. 第一个空白分隔的词（有配置前缀时去掉一个，'/' 只有配置了才去掉）能被 resolve 找到，且不在 notCommands 里（不区分大小写）；
+ *    调用方传 ctx.$commander.resolve，不带 session，禁用的别名也算。
+ * 2. 整条消息按空白分最多 3 段（中文没有空格时就是一段）。
  */
-export function isCommand(text: string, prefixes: string[], resolve: (word: string) => unknown): boolean {
-  let word = text.trim().split(/\s+/)[0] ?? ''
+export function isCommand(text: string, prefixes: string[], resolve: (word: string) => unknown, notCommands: string[] = []): boolean {
+  const parts = text.trim().split(/\s+/)
+  if (parts.length > 3) return false
+  let word = parts[0] ?? ''
   const sorted = prefixes.filter((p) => typeof p === 'string' && p).sort((a, b) => b.length - a.length)
   for (const prefix of sorted) {
     if (word.startsWith(prefix)) {
@@ -31,6 +35,8 @@ export function isCommand(text: string, prefixes: string[], resolve: (word: stri
     }
   }
   if (!word) return false
+  const lower = word.toLowerCase()
+  if (notCommands.some((w) => w.toLowerCase() === lower)) return false
   try {
     return !!resolve(word)
   } catch {
