@@ -2,20 +2,23 @@
 // 回复一律用元素数组并自己 catch（session.send 出错时会把整条内容写进日志，R10）。
 
 import { h } from 'koishi'
-import type { Context, Session } from 'koishi'
+import type { Command, Context, Session } from 'koishi'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import type { Bridge } from './bridges'
 import { bridgesToYaml, convertOldConfig, findOldConfigs, formatReport } from './import'
 import { describeError } from './log'
+import { qqOnline } from './qq/api'
 import type { Relay } from './relay'
 import { splitText } from './text/split'
+import { utcOffset } from './util'
 
 const DIRECTION_TEXT = { both: '双向', d2q: 'Discord→QQ', q2d: 'QQ→Discord' }
 
-function timeFormatter(timeZone: string) {
+/** 时间后面标上时区（A8），例如 `09/30 12:38 (UTC+8)`；本机时区和配置的时区不同时不会看错。 */
+export function timeFormatter(timeZone: string) {
   const format = new Intl.DateTimeFormat('zh-CN', { timeZone, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })
-  return (ms: number) => (ms ? format.format(new Date(ms)) : '无')
+  return (ms: number) => (ms ? `${format.format(new Date(ms))} (${utcOffset(ms, timeZone)})` : '无')
 }
 
 async function reply(session: Session, text: string) {
@@ -54,10 +57,30 @@ export function findBridges(relay: Relay, target: string): { bridges: Bridge[]; 
   return named.length ? { bridges: named } : { bridges: [], error: `没有找到桥「${text}」` }
 }
 
+/**
+ * 要显示的、开了 @全体 的桥所在的 QQ 群：每个群实时查一次剩余次数（A8）。
+ * 同一个群只查一次，所有群并行，每个最多 8 秒（和 @全体 判断用同一个超时），所以整个命令不会等太久。
+ */
+async function liveRemains(relay: Relay, filter: (b: { discord: string; qq: string }) => boolean) {
+  const groups = new Set<string>()
+  for (const row of relay.settings.rows) {
+    if (filter(row) && !row.invalid && row.enabled && row.bridge?.atAll) groups.add(row.bridge.qq)
+  }
+  const result = new Map<string, Awaited<ReturnType<Relay['gate']['refreshRemain']>>>()
+  if (!groups.size) return result
+  const bot = relay.qqBot()
+  await Promise.all([...groups].map(async (group) => {
+    result.set(group, bot && qqOnline(bot) ? await relay.gate.refreshRemain(bot, group) : { error: 'QQ 机器人不在线' })
+  }))
+  return result
+}
+
 export async function statusText(relay: Relay, filter: (b: { discord: string; qq: string }) => boolean, all = true): Promise<string> {
   const lines: string[] = []
   const settings = relay.settings
   const time = timeFormatter(settings.timeZone)
+  // 统计只在内存里，每次重载清零（A8）
+  lines.push(`统计从 ${time(relay.stats.startedAt)} 重载后开始`)
   if (relay.paused.has('global')) lines.push('⏸ 全局暂停中')
   for (const problem of settings.problems) lines.push(`⚠ ${problem}`)
   if (relay.pausedTr.has('global')) lines.push('⏸ 翻译全局暂停中')
@@ -73,6 +96,7 @@ export async function statusText(relay: Relay, filter: (b: { discord: string; qq
     const problem = relay.botProblem(platform)
     if (problem) lines.push(`⚠ ${problem}`)
   }
+  const remains = await liveRemains(relay, filter)
   const date = new Intl.DateTimeFormat('en-CA', { timeZone: settings.timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(relay.now()))
   let shown = 0
   for (const row of settings.rows) {
@@ -103,10 +127,18 @@ export async function statusText(relay: Relay, filter: (b: { discord: string; qq
     for (const problem of relay.health.get(bridge.key) ?? []) lines.push(`   ${problem.startsWith('⚠') ? problem : `⚠ ${problem}`}`)
     for (const warning of row.warnings) lines.push(`   ⚠ ${warning}`)
     if (bridge.atAll) {
-      const remain = relay.gate.remain.get(bridge.qq)
+      const live = remains.get(bridge.qq)
+      let remain: string
+      if (live && 'remain' in live) remain = `${live.remain.forUin} / ${live.remain.forGroup}（机器人 / 全群）`
+      else {
+        // 查不到：写清楚原因；以前查到过的话附上那次的结果
+        const cached = relay.gate.remain.get(bridge.qq)
+        const reason = live?.error ?? '未知'
+        remain = cached ? `${reason}（上次查到 ${cached.forUin} / ${cached.forGroup}，${time(cached.checkedAt)}）` : reason
+      }
       const fallbacks = [...relay.stats.atAllFallbacks(bridge.qq, date)].map(([reason, n]) => `${reason} ${n}`).join('、')
       const used = await relay.gate.usedToday(bridge.qq).catch(() => undefined)
-      lines.push(`   @全体：今天用了 ${used ?? '?'} 次，剩余 ${remain ? `${remain.forUin} / ${remain.forGroup}（机器人 / 全群）` : '未知'}${fallbacks ? `，改发文字：${fallbacks}` : ''}`)
+      lines.push(`   @全体：今天用了 ${used ?? '?'} 次，剩余 ${remain}${fallbacks ? `，改发文字：${fallbacks}` : ''}`)
     }
   }
   if (!shown) lines.push('没有相关的桥。')
@@ -115,8 +147,18 @@ export async function statusText(relay: Relay, filter: (b: { discord: string; qq
 
 export function registerCommands(ctx: Context, relay: Relay) {
   const authority = relay.settings.authority
+  // 本插件注册的命令都记到 relay.ownCommands 里，这些命令的消息不转发（A8）。以后加的命令也要用这个函数注册；
+  // 自动建出来的上级命令（bridge）记到 ownGroups：bridge.xxx 形式的新命令即使漏记了也不会被转发
+  const command = ((...args: Parameters<Context['command']>) => {
+    const created = ctx.command(...args)
+    relay.ownCommands.add(created)
+    for (let c: Command | null = created.parent; c; c = c.parent) {
+      if (c.ctx?.scope === ctx.scope && !relay.ownCommands.has(c)) relay.ownGroups.add(c)
+    }
+    return created
+  }) as Context['command']
 
-  ctx.command('bridge.status [target:string]', '查看转发状态', { authority })
+  command('bridge.status [target:string]', '查看转发状态', { authority })
     .alias('桥接状态')
     .option('all', '-a 显示全部（私聊时）')
     .action(async ({ session, options }, target) => {
@@ -158,17 +200,17 @@ export function registerCommands(ctx: Context, relay: Relay) {
     }
   }
 
-  ctx.command('bridge.pause [target:string]', '暂停转发（不带参数 = 全局暂停）', { authority })
+  command('bridge.pause [target:string]', '暂停转发（不带参数 = 全局暂停）', { authority })
     .alias('桥接暂停')
     .option('translate', '-t 只暂停翻译')
     .action(pauseAction(true))
 
-  ctx.command('bridge.resume [target:string]', '恢复转发', { authority })
+  command('bridge.resume [target:string]', '恢复转发', { authority })
     .alias('桥接恢复')
     .option('translate', '-t 只恢复翻译')
     .action(pauseAction(false))
 
-  ctx.command('bridge.reload', '重新读取关键词文件和黑话表', { authority })
+  command('bridge.reload', '重新读取关键词文件和黑话表', { authority })
     .action(async ({ session }) => {
       if (!session) return
       try {
@@ -184,7 +226,7 @@ export function registerCommands(ctx: Context, relay: Relay) {
       }
     })
 
-  ctx.command('bridge.import', '从 @myrtus/forward 的配置生成桥（只输出，不改配置）', { authority })
+  command('bridge.import', '从 @myrtus/forward 的配置生成桥（只输出，不改配置）', { authority })
     .action(async ({ session }) => {
       if (!session) return
       if (!session.isDirect) return void reply(session, '请私聊机器人使用这个命令。')

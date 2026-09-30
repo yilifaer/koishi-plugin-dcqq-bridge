@@ -2,6 +2,7 @@
 // 所以不会有两条同时通过检查。查询出错一律按不通过处理（S17：LLBot 自己查失败时会照发）。
 
 import type { AtAllConfig } from './config'
+import { describeError } from './log'
 import type { Store } from './store'
 import type { Msg } from './types'
 
@@ -27,6 +28,7 @@ export interface AtAllGateOptions {
 }
 
 class QueryTimeout extends Error {}
+class InvalidRemain extends Error {}
 
 /** 超时就拒绝；原来的 promise 晚到的结果被丢弃。 */
 function withTimeout<T>(p: Promise<T> | T, ms: number): Promise<T> {
@@ -82,6 +84,28 @@ export class AtAllGate {
     return admin
   }
 
+  /** 查一次剩余次数（最多 queryTimeout）。出错、超时或返回内容不对时抛出；不更新缓存。 */
+  private async fetchRemain(bot: any, groupId: string) {
+    const remain: any = await this.query(bot.internal.getGroupAtAllRemain(groupId))
+    const forGroup = Number(remain?.remain_at_all_count_for_group)
+    const forUin = Number(remain?.remain_at_all_count_for_uin)
+    if (typeof remain?.can_at_all !== 'boolean' || !Number.isFinite(forGroup) || !Number.isFinite(forUin)) throw new InvalidRemain()
+    return { canAtAll: remain.can_at_all as boolean, forGroup, forUin }
+  }
+
+  /** bridge.status 用（A8）：实时查一次剩余次数并更新缓存；查不到时返回原因。 */
+  async refreshRemain(bot: any, groupId: string): Promise<{ remain: AtAllRemain } | { error: string }> {
+    try {
+      const { forGroup, forUin } = await this.fetchRemain(bot, groupId)
+      const remain = { forGroup, forUin, checkedAt: this.now() }
+      this.remain.set(groupId, remain)
+      return { remain }
+    } catch (e) {
+      const reason = e instanceof QueryTimeout ? '超时' : e instanceof InvalidRemain ? '返回的内容不对' : describeError(e).slice(0, 80)
+      return { error: `查询失败：${reason}` }
+    }
+  }
+
   /** 每个查询最多 queryTimeout，整体最多 decideTimeout；超时按「查询失败」，晚到的结果不产生任何效果。 */
   async decide(bot: any, groupId: string, msg: Msg): Promise<AtAllDecision> {
     const state = { expired: false }
@@ -121,18 +145,16 @@ export class AtAllGate {
     } catch {
       return { ok: false, reason: '查询失败' }
     }
-    let remain: any
+    let remain: { canAtAll: boolean; forGroup: number; forUin: number }
     try {
-      remain = await this.query(bot.internal.getGroupAtAllRemain(groupId))
+      remain = await this.fetchRemain(bot, groupId)
     } catch {
       return { ok: false, reason: '查询失败' }
     }
-    const forGroup = Number(remain?.remain_at_all_count_for_group)
-    const forUin = Number(remain?.remain_at_all_count_for_uin)
-    if (typeof remain?.can_at_all !== 'boolean' || !Number.isFinite(forGroup) || !Number.isFinite(forUin)) return { ok: false, reason: '查询失败' }
+    const { forGroup, forUin } = remain
     if (state.expired) return { ok: false, reason: '查询失败' }
     this.remain.set(groupId, { forGroup, forUin, checkedAt: this.now() })
-    if (!remain.can_at_all || forUin <= 0 || forGroup <= config.reserve) return { ok: false, reason: '次数用完' }
+    if (!remain.canAtAll || forUin <= 0 || forGroup <= config.reserve) return { ok: false, reason: '次数用完' }
 
     const previousLast = await this.query(this.store.get<number>(lastKey)).catch(() => undefined)
     if (state.expired) return { ok: false, reason: '查询失败' }

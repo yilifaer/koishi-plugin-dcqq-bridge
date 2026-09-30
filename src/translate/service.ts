@@ -11,7 +11,7 @@ import { buildGlossary, Glossary, loadCommonWords, loadEveData, parseSlangYaml }
 import type { Msg } from '../types'
 import { Translator } from './client'
 import { protect, restore, stripTokens } from './protect'
-import { isCommand, skipReason } from './skip'
+import { isCommand, rootPrefixes, skipReason } from './skip'
 
 export type TranslateDirection = 'en2zh' | 'zh2en'
 
@@ -144,9 +144,7 @@ export class TranslationService {
   }
 
   private prefixes(): string[] {
-    const raw = (this.ctx.root.config as any)?.prefix
-    const list = Array.isArray(raw) ? raw : raw === undefined || raw === null ? [] : [raw]
-    return list.filter((p): p is string => typeof p === 'string' && p !== '')
+    return rootPrefixes(this.ctx.root.config)
   }
 
   async translate(msg: Msg, direction: TranslateDirection): Promise<TranslationOutcome> {

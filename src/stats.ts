@@ -16,7 +16,12 @@ export class Stats {
   /** 这个 QQ 群今天因为什么原因改发了文字：群号 → 日期 → 原因 → 次数。 */
   private fallbacks = new Map<string, { date: string; reasons: Map<string, number> }>()
 
-  constructor(private now: () => number = Date.now) {}
+  /** 统计从什么时候开始（插件每次重载都重新开始，A8）。 */
+  readonly startedAt: number
+
+  constructor(private now: () => number = Date.now) {
+    this.startedAt = now()
+  }
 
   private entry(key: string) {
     let stats = this.map.get(key)
