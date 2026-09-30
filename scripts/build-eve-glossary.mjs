@@ -33,6 +33,11 @@ const CODE_NAME = /^[A-Z0-9]{1,5}-[A-Z0-9]{1,5}$/
 const WH_REGION_MIN = 11000000
 const WH_CONSTELLATION_MIN = 21000000
 export const KIND_ORDER = ['type', 'group', 'category', 'system', 'region', 'constellation']
+/**
+ * 物品词条额外带上的类别标记（只给运行时要用的类别加，保持文件小）：
+ * ship = 舰船（去掉「级」的写法，U4），structure = 建筑（建筑通知里的建筑类型，U6）
+ */
+export const TYPE_CAT_MARKERS = new Map([[6, 'ship'], [65, 'structure']])
 
 function parseArgs(argv) {
   const args = { zip: null, url: null, out: 'data/eve-glossary.json' }
@@ -139,14 +144,14 @@ export async function buildFromZip(zipPath) {
     if (buildNumber == null) throw new Error('_sde.jsonl 里没有 buildNumber')
 
     const raw = []
-    const add = (kind, obj) => {
+    const add = (kind, obj, cat) => {
       const n = names(obj)
       if (!n.ok) {
         if (n.same) stats.skippedSame[kind]++
         else stats.skippedMissing[kind]++
         return
       }
-      raw.push({ en: n.en, zh: n.zh, kind })
+      raw.push(cat ? { en: n.en, zh: n.zh, kind, cat } : { en: n.en, zh: n.zh, kind })
     }
 
     // 类别
@@ -176,7 +181,7 @@ export async function buildFromZip(zipPath) {
       if (t.published !== true || t.marketGroupID == null) return
       const cat = groupCategory.get(t.groupID)
       if (!TYPE_CATEGORIES.has(cat) || excludedCats.has(cat)) return
-      add('type', t)
+      add('type', t, TYPE_CAT_MARKERS.get(cat))
     })
 
     // 地图：排除代号名字和虫洞等特殊空间
@@ -216,7 +221,7 @@ export async function buildFromZip(zipPath) {
 /** 紧凑输出，每条一行，方便看 diff */
 export function serialize(data) {
   const head = `{"buildNumber":${JSON.stringify(data.buildNumber)},"generatedAt":${JSON.stringify(data.generatedAt)},"entries":[`
-  const lines = data.entries.map((e) => JSON.stringify({ en: e.en, zh: e.zh, kind: e.kind }))
+  const lines = data.entries.map((e) => JSON.stringify(e.cat ? { en: e.en, zh: e.zh, kind: e.kind, cat: e.cat } : { en: e.en, zh: e.zh, kind: e.kind }))
   return lines.length ? `${head}\n${lines.join(',\n')}\n]}\n` : `${head}]}\n`
 }
 

@@ -234,7 +234,7 @@ describe('接进转发', () => {
     env.discordMessage({ content: 'CTA Rifter' })
     await env.idle()
     expect(llm.chat).toHaveLength(0)
-    expect(env.qq.text(QQ_GROUP)[0]).toContain('【机翻】 集结 裂谷级')
+    expect(env.qq.text(QQ_GROUP)[0]).toContain('【机翻】 集结裂谷级') // U11：两个中文术语之间不留空格
   })
 
   it('B3：只有 keep 术语（加上网址等保护内容）→ 跳过，原因「只有术语」', async () => {

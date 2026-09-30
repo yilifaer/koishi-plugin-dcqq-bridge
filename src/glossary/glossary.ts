@@ -3,6 +3,7 @@ import { DIRS, MODES } from './types'
 import type {
   Direction, EveEntry, GlossaryApplication, GlossaryDir, GlossaryMode, GlossaryOptions, GlossarySources, SystemStyle,
 } from './types'
+import { structureTypeNames } from './load'
 
 // 术语匹配（清单 §12.3，决定 P2）。
 // 索引：每个方向一张表，键是来源词的前 2 个字符（ASCII 小写），值是按长度从长到短排好的候选。
@@ -66,13 +67,33 @@ function placeValue(en: string, zh: string, style: SystemStyle): string {
 export class Glossary {
   readonly version: string
   readonly size: number
+  /** 去掉「级」的舰船名写法加了多少条（U4，给日志和测试用） */
+  readonly shipAliases: number
   private readonly indexes: Record<Direction, Index>
+  private readonly structures: readonly string[]
 
   /** 内部使用；请用 buildGlossary() */
-  constructor(indexes: Record<Direction, Index>, size: number, version: string) {
+  constructor(indexes: Record<Direction, Index>, size: number, version: string, structures: readonly string[] = [], shipAliases = 0) {
     this.indexes = indexes
     this.size = size
     this.version = version
+    this.structures = structures
+    this.shipAliases = shipAliases
+  }
+
+  /**
+   * 官方表里建筑类（SDE 类别 65）物品的英文名（U6）：Astrahus、Fortizar、Keepstar、Ansiblex Jump Bridge 等，
+   * 按长度从长到短。没有加载官方表（`glossary.eve` 关闭）时是空列表。
+   */
+  structureTypeNames(): string[] {
+    return [...this.structures]
+  }
+
+  /** 整段文字正好是某个词条的原文（U7：群友名片里和术语相同的一段不当作名字）。 */
+  hasSource(text: string, direction: Direction): boolean {
+    const lower = asciiLower(text)
+    const list = this.indexes[direction].get(lower.slice(0, 2)) ?? []
+    return list.some((c) => (c.exact ? c.term === text : c.lower === lower))
   }
 
   apply(text: string, direction: Direction): GlossaryApplication {
@@ -214,6 +235,7 @@ export function buildGlossary(options: GlossaryOptions, sources: GlossarySources
   const warnings: string[] = []
   const terms: Record<Direction, RawTerm[]> = { en2zh: [], zh2en: [] }
   let size = 0
+  let shipAliases = 0
 
   // overrides 和黑话表：保持声明的 mode（只受 P2 大小写限制）
   const addUser = (
@@ -262,6 +284,8 @@ export function buildGlossary(options: GlossaryOptions, sources: GlossarySources
       && !CODE_NAME_RE.test(e.en.trim()))
     // 一个中文对应多个英文的，不用于中译英
     const zhToEn = new Map<string, Set<string>>()
+    // 已有的中译英来源写法（overrides、纠错、黑话表，含 zh_aliases）：去掉「级」的船名和它们重复时不加（U4）
+    const userZh = new Set(terms.zh2en.map((t) => asciiLower(t.source)))
     for (const e of official) {
       const zh = e.zh.trim()
       if (!zhToEn.has(zh)) zhToEn.set(zh, new Set())
@@ -286,12 +310,22 @@ export function buildGlossary(options: GlossaryOptions, sources: GlossarySources
         terms.en2zh.push({ source: en, mode, value, hint, priority, english: true, common })
         used = true
       }
-      // 1 个字的中文不收
-      if (charLength(zh) >= MIN_LENGTH && zhToEn.get(zh)!.size === 1) {
+      // 1 个字的中文不收；2 个字的组别、类别名多是普通词（其他、建筑、工具），也不收，连 hint 都不要（U5）
+      const plainWord = (e.kind === 'group' || e.kind === 'category') && charLength(zh) === 2
+      if (charLength(zh) >= MIN_LENGTH && !plainWord && zhToEn.get(zh)!.size === 1) {
         const short = charLength(zh) < 3 && !zh.endsWith('级')
         const mode: GlossaryMode = place || short ? 'hint' : 'force'
         terms.zh2en.push({ source: zh, mode, value: en, hint, priority, english: false })
         used = true
+        // 舰船名玩家一般不带「级」（U4）：去掉以后 3 个字及以上才加，模式和原词条一样；
+        // 2 个字的（灾难、挑战）多是普通词，交给黑话表人工挑选；和别的官方名称、用户词条重复时不加（用户词条优先）
+        if (e.kind === 'type' && e.cat === 'ship' && zh.endsWith('级')) {
+          const bare = zh.slice(0, -1).trim()
+          if (charLength(bare) >= 3 && !zhToEn.has(bare) && !userZh.has(asciiLower(bare))) {
+            terms.zh2en.push({ source: bare, mode, value: en, hint, priority, english: false })
+            shipAliases++
+          }
+        }
       }
       if (used) size++
     }
@@ -319,5 +353,7 @@ export function buildGlossary(options: GlossaryOptions, sources: GlossarySources
     indexes[direction] = index
   }
 
-  return { glossary: new Glossary(indexes, size, hash.digest('hex')), warnings }
+  // 建筑类型名只用于保护（U6），不参与匹配；和官方名称表一样，只在 glossary.eve 打开时有
+  const structures = structureTypeNames(eve)
+  return { glossary: new Glossary(indexes, size, hash.digest('hex'), structures, shipAliases), warnings }
 }

@@ -185,6 +185,11 @@ export class FakeQQ {
         const member = this.members.get(`${params.group_id}:${params.user_id}`)
         return member ? ok({ group_id: params.group_id, user_id: params.user_id, ...member }) : { status: 'failed', retcode: 100, data: null }
       }
+      case 'get_group_member_list': {
+        const list = [...this.members].filter(([key]) => key.startsWith(`${params.group_id}:`))
+          .map(([key, m]) => ({ group_id: +params.group_id, user_id: +key.split(':')[1], ...m }))
+        return ok(list)
+      }
       case 'get_group_at_all_remain':
         return ok(this.atAllRemain)
       case 'get_msg': {
@@ -242,7 +247,7 @@ export interface Env {
 
 /** PR 2 新增的配置项的默认值（全部关闭）。 */
 export const PR2_DEFAULTS: Pick<Config, 'translate' | 'filter' | 'glossary'> = {
-  translate: { enabled: false, baseURL: '', apiKey: '', model: '', label: '【机翻】', timeoutMs: 6000, maxPerHour: 0, extraBody: '', notCommands: 'help', keepValueLabels: '' },
+  translate: { enabled: false, baseURL: '', apiKey: '', model: '', label: '【机翻】', timeoutMs: 6000, maxPerHour: 0, extraBody: '', notCommands: 'help', keepValueLabels: '', context: '', protectMemberNames: true },
   filter: { keywords: '', keywordFile: '', moderation: false, moderationBaseURL: 'https://api.openai.com/v1', moderationApiKey: '' },
   glossary: { eve: false, systemStyle: 'en(zh)', slangFile: '', overrides: [] },
 }

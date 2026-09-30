@@ -51,6 +51,10 @@ export interface TranslateSettings {
   notCommands: string[]
   /** 冒号后面内容不翻译的标签（小写，连续空白合成一个）。 */
   keepValueLabels: string[]
+  /** 加在系统提示词最后的背景说明（U2，去掉首尾空白）；空字符串表示不加。 */
+  context: string
+  /** 中译英时保护 QQ 群成员名片里的名字（U7），默认开。 */
+  protectMemberNames: boolean
 }
 
 export interface FilterSettings {
@@ -169,6 +173,8 @@ export function normalizeSettings(config: Partial<Config>): Settings {
     extraBody: parseExtraBody(text(tr.extraBody), problems),
     notCommands: [...new Set(text(tr.notCommands, 'help').split(';;').map((w) => w.trim().toLowerCase()).filter(Boolean))],
     keepValueLabels: [...new Set(text(tr.keepValueLabels).split(';;').map(normalizeLabel).filter(Boolean))],
+    context: text(tr.context).trim(),
+    protectMemberNames: tr.protectMemberNames !== false,
   }
   if (translate.enabled && (!translate.baseURL || !translate.model)) {
     problems.push('翻译已打开，但没有填接口地址或模型，按关闭处理')

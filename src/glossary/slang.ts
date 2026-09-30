@@ -95,16 +95,29 @@ export interface SlangFileSummary {
   name: string
   /** 这个文件里的有效词条数；读不到时为 null */
   count: number | null
-  /** 其中覆盖了前面文件里同一个原文的条数 */
+  /** 覆盖了前面文件里多少条词条（整条覆盖，或者 both 词条被覆盖了一个方向，都算一条） */
   replaced: number
 }
 
-/** 同一个原文：en 不区分大小写，或 zh 完全一样 */
-const sameSource = (a: SlangEntry, b: SlangEntry) => a.en.toLowerCase() === b.en.toLowerCase() || a.zh === b.zh
+/** 词条用到的方向 */
+const dirsOf = (e: SlangEntry): Array<'en2zh' | 'zh2en'> => (e.dir === 'both' ? ['en2zh', 'zh2en'] : [e.dir])
 
 /**
- * 按顺序合并多个文件的词条：后面文件里同一个原文的词条覆盖前面文件的（同一个文件里的重复不在这里处理，
- * 还是交给 buildGlossary，和只有一个文件时一样）。
+ * 同一个原文按方向判断（U1）：英译中比 en（不区分大小写），中译英比 zh。
+ * 两个都是 both：en 或 zh 相同就算同一个原文，整条覆盖（和 T8 一样）；
+ * 方向不同时只在共有的方向上比较。返回前面的词条 older 被后面的 newer 覆盖掉的方向。
+ */
+function overriddenDirs(older: SlangEntry, newer: SlangEntry): Array<'en2zh' | 'zh2en'> {
+  const enSame = older.en.toLowerCase() === newer.en.toLowerCase()
+  const zhSame = older.zh === newer.zh
+  if (older.dir === 'both' && newer.dir === 'both') return enSame || zhSame ? ['en2zh', 'zh2en'] : []
+  const newerDirs = dirsOf(newer)
+  return dirsOf(older).filter((d) => newerDirs.includes(d) && (d === 'en2zh' ? enSame : zhSame))
+}
+
+/**
+ * 按顺序合并多个文件的词条：后面文件里同一个原文的词条覆盖前面文件的（按方向判断，见 overriddenDirs；
+ * 同一个文件里的重复不在这里处理，还是交给 buildGlossary，和只有一个文件时一样）。
  * where：每条词条给警告用的位置，例如「黑话表 local-slang.yaml 第 2 条」；只有一个文件时和以前一样是「黑话表第 2 条」。
  */
 export function mergeSlangFiles(files: SlangFileResult[]): {
@@ -122,9 +135,19 @@ export function mergeSlangFiles(files: SlangFileResult[]): {
     const entries = file.entries ?? []
     let replaced = 0
     if (!single && entries.length) {
-      const before = merged.length
-      merged = merged.filter((m) => !entries.some((e) => sameSource(m.entry, e)))
-      replaced = before - merged.length
+      const next: typeof merged = []
+      for (const m of merged) {
+        const lost = new Set(entries.flatMap((e) => overriddenDirs(m.entry, e)))
+        if (!lost.size) {
+          next.push(m)
+          continue
+        }
+        replaced++
+        // 前面的 both 词条只被覆盖了一个方向：留下另一个方向（例如后面的 en2zh 覆盖了它，它只剩 zh2en）
+        const left = dirsOf(m.entry).filter((d) => !lost.has(d))
+        if (left.length) next.push({ entry: { ...m.entry, dir: left[0] }, where: m.where })
+      }
+      merged = next
     }
     entries.forEach((entry, j) => merged.push({ entry, where: single ? `黑话表第 ${j + 1} 条` : `黑话表 ${name} 第 ${j + 1} 条` }))
     summary.push({ path: file.path, name, count: file.entries ? entries.length : null, replaced })

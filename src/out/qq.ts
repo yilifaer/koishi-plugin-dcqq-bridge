@@ -49,6 +49,15 @@ export function buildQQSends(input: QQSendInput): Element[][] {
   const pieces = splitText(body, Math.max(10, limit - prefixCost), Math.max(10, limit - firstCost))
   if (!pieces.length) pieces.push('')
 
+  // U10：一条消息放得下、并且有图片和译文时，顺序改成「原文 → 图片 → 译文」，免得图片看起来像译文的一部分；
+  // 需要分段发送时保持「原文 → 译文 → 图片」
+  const translation = input.translation?.trim() ? input.translation.trimEnd() : ''
+  const imagesFirst = pieces.length === 1 && images.length > 0 && translation !== ''
+  if (imagesFirst) {
+    const original = [input.text.trim() !== '' ? input.text.trimEnd() : '', ...placeholders].filter(Boolean).join('\n')
+    pieces[0] = original
+  }
+
   const sends = pieces.map((piece, index) => {
     const first = index === 0
     const elements: Element[] = []
@@ -67,6 +76,7 @@ export function buildQQSends(input: QQSendInput): Element[][] {
     if (content) elements.push(h.text(content))
     if (index === pieces.length - 1) {
       for (const image of images) elements.push(h.image(Buffer.from(image.data), image.mime))
+      if (imagesFirst) elements.push(h.text('\n' + translation))
     }
     return elements
   })

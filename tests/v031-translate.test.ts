@@ -169,12 +169,12 @@ describe('T7：换进去的中文术语两边的空格', () => {
     expect(t('小心 ⟦G0⟧ 。')).toBe('小心墩子。')
   })
 
-  it('旁边是英文、数字、被保护的内容、另一个术语、换行时空格照旧；换进去的是英文时不动', () => {
+  it('旁边是英文、数字、被保护的内容、换行时空格照旧；换进去的是英文时不动', () => {
     expect(t('Jita 有 ⟦G0⟧ x')).toBe('Jita 有墩子 x')
     expect(t('⟦0⟧ ⟦G0⟧ ⟦1⟧')).toBe('⟦0⟧ 墩子 ⟦1⟧')
     expect(t('在\n⟦G0⟧\n在')).toBe('在\n墩子\n在')
     expect(t('当心 ⟦G0⟧ 在', 'Keepstar')).toBe('当心 Keepstar 在')
-    expect(restoreTerms('集结 ⟦G0⟧ ⟦G1⟧ 了', [{ token: '⟦G0⟧', value: '墩子' }, { token: '⟦G1⟧', value: '裂谷级' }])).toBe('集结墩子 裂谷级了')
+    expect(restoreTerms('集结 ⟦G0⟧ ⟦G1⟧ 了', [{ token: '⟦G0⟧', value: '墩子' }, { token: '⟦G1⟧', value: '裂谷级' }])).toBe('集结墩子裂谷级了') // U11：两个中文术语之间的空格也去掉
   })
 
   it('不认识的占位符原样留下', () => {

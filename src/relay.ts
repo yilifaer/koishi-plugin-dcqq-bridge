@@ -17,6 +17,7 @@ import { qqOnline, sendQQ } from './qq/api'
 import { MessageRow, Store } from './store'
 import { Stats } from './stats'
 import { TranslationOutcome, TranslationService } from './translate/service'
+import { MemberNames } from './translate/names'
 import { commandWord, rootPrefixes } from './translate/skip'
 import { deletedReplyLine, prefixFor, replyLine, stripOwnDecorations } from './text/reply'
 import type { FileData, Msg } from './types'
@@ -134,6 +135,7 @@ export class Relay {
     this.dateOf = dateIn(this.settings.timeZone)
     this.gate = new AtAllGate(this.store, () => this.settings.atAll, this.dateOf, this.now)
     this.translation = new TranslationService(ctx, () => this.settings, this.logger, this.now)
+    this.translation.memberNames = new MemberNames((group) => this.qqBot()?.internal?.getGroupMemberList(group), this.now)
     // 无效的行已经在 problems 里（F5），不再单独写一遍
     for (const problem of this.settings.problems) this.logger.warn(problem)
     for (const row of this.settings.rows) {

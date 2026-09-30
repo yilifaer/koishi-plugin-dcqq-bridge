@@ -10,7 +10,7 @@ const run = promisify(execFile)
 const root = resolve(__dirname, '..')
 const script = join(root, 'scripts/build-eve-glossary.mjs')
 
-type Entry = { en: string; zh: string; kind: string }
+type Entry = { en: string; zh: string; kind: string; cat?: string }
 const nm = (en: string, zh?: string) => ({ name: zh === undefined ? { en } : { en, zh, de: `${en} (de)` } })
 const jsonl = (rows: object[]) => rows.map((r) => JSON.stringify(r)).join('\n') + '\n'
 
@@ -19,6 +19,7 @@ const files: Record<string, object[]> = {
   'categories.jsonl': [
     { _key: 6, published: true, ...nm('Ship', '舰船') },
     { _key: 7, published: true, ...nm('Module', '装备') },
+    { _key: 65, published: true, ...nm('Structure', '建筑') },
     { _key: 9, published: true, ...nm('Blueprint', '蓝图') },
     { _key: 16, published: true, ...nm('Skill', '技能') },
     { _key: 30, published: true, ...nm('Apparel', '服饰') },
@@ -32,6 +33,7 @@ const files: Record<string, object[]> = {
   'groups.jsonl': [
     { _key: 25, categoryID: 6, published: true, ...nm('  Frigate ', ' 护卫舰 ') }, // 修剪空白
     { _key: 26, categoryID: 7, published: true, ...nm('Shield Booster', '护盾回充增量器') },
+    { _key: 1657, categoryID: 65, published: true, ...nm('Citadel', '铁壁') },
     { _key: 27, categoryID: 6, published: false, ...nm('Hidden Group', '隐藏组') },
     { _key: 105, categoryID: 9, published: true, ...nm('Frigate Blueprint', '护卫舰蓝图') },
     { _key: 1950, categoryID: 91, published: true, ...nm('Rifter SKINs', '裂谷级涂装') },
@@ -43,6 +45,7 @@ const files: Record<string, object[]> = {
     { _key: 587, groupID: 25, marketGroupID: 64, published: true, ...nm('Rifter', '裂谷级') },
     { _key: 588, groupID: 25, published: true, ...nm('Reaper', '收割者级') }, // 没有 marketGroupID
     { _key: 589, groupID: 25, marketGroupID: 64, published: false, ...nm('Unpublished Ship', '未发布舰船') },
+    { _key: 35832, groupID: 1657, marketGroupID: 6, published: true, ...nm('Astrahus', '空堡') }, // 建筑：带 cat
     { _key: 590, groupID: 26, marketGroupID: 1, published: true, ...nm('Small Shield Booster I', '小型护盾回充增量器 I') },
     { _key: 591, groupID: 26, marketGroupID: 1, published: true, ...nm('ECM', 'ECM') }, // 中英相同
     { _key: 691, groupID: 105, marketGroupID: 2, published: true, ...nm('Rifter Blueprint', '裂谷级蓝图') },
@@ -114,14 +117,17 @@ describe('scripts/build-eve-glossary.mjs', () => {
     expect(text).not.toMatch(/\n\s+\{/)
 
     expect(data.entries).toEqual([
-      { en: 'Rifter', zh: '裂谷级', kind: 'type' },
+      { en: 'Astrahus', zh: '空堡', kind: 'type', cat: 'structure' },
+      { en: 'Rifter', zh: '裂谷级', kind: 'type', cat: 'ship' },
       { en: 'Small Shield Booster I', zh: '小型护盾回充增量器 I', kind: 'type' },
+      { en: 'Citadel', zh: '铁壁', kind: 'group' },
       { en: 'Frigate', zh: '护卫舰', kind: 'group' },
       { en: 'Shield Booster', zh: '护盾回充增量器', kind: 'group' },
       { en: 'Sun', zh: '恒星', kind: 'group' },
       { en: 'Celestial', zh: '天体', kind: 'category' },
       { en: 'Module', zh: '装备', kind: 'category' },
       { en: 'Ship', zh: '舰船', kind: 'category' },
+      { en: 'Structure', zh: '建筑', kind: 'category' },
       { en: 'Jita', zh: '吉他', kind: 'system' },
       { en: 'Perimeter', zh: '皮尔米特', kind: 'system' },
       { en: 'Delve', zh: '绝地之域', kind: 'region' },

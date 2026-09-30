@@ -3,6 +3,8 @@
 export interface Token {
   token: string
   value: string
+  /** 这个占位符是网址（U8：还原时两边按需补空格）。 */
+  url?: boolean
 }
 
 /** 任何 ⟦…⟧ 形式的占位符（包括术语表的 ⟦G0⟧）。 */
@@ -121,7 +123,8 @@ export function protect(text: string, spans: string[], keep: Range[] = []): { te
   }
   // 2. 原文里的 ⟦⟧；3. 网址
   for (const m of text.matchAll(LITERAL)) claim(m.index!, m.index! + m[0].length)
-  for (const m of text.matchAll(URL_RE)) claim(m.index!, m.index! + trimUrl(m[0]).length)
+  const urls = new Set<number>()
+  for (const m of text.matchAll(URL_RE)) if (claim(m.index!, m.index! + trimUrl(m[0]).length)) urls.add(m.index!)
   // 4. 其余规则：最左、最长优先
   const found: Range[] = []
   for (const re of PATTERNS) {
@@ -136,7 +139,7 @@ export function protect(text: string, spans: string[], keep: Range[] = []): { te
   let last = 0
   for (const [s, e] of taken) {
     const token = `⟦${tokens.length}⟧`
-    tokens.push({ token, value: text.slice(s, e) })
+    tokens.push(urls.has(s) ? { token, value: text.slice(s, e), url: true } : { token, value: text.slice(s, e) })
     out += text.slice(last, s) + token
     last = e
   }
@@ -144,26 +147,47 @@ export function protect(text: string, spans: string[], keep: Range[] = []): { te
   return { text: out, tokens }
 }
 
-export function restore(text: string, tokens: Array<{ token: string; value: string }>): string {
-  const map = new Map(tokens.map((t) => [t.token, t.value]))
-  return text.replace(ANY_TOKEN, (m) => map.get(m) ?? m)
-}
-
 // 汉字和中文标点（全角标点、CJK 标点、中文引号、省略号、破折号等）
 const CJK_EDGE = /[\p{Script=Han}\u3000-\u303f\uff00-\uffef“”‘’…—·]/u
 const HAN_EDGE = /\p{Script=Han}/u
+// 英文字母或数字（U3）
+const ALNUM = /[A-Za-z0-9]/
+// 英文复数词尾，后面是词边界（U3：`⟦G0⟧s` → `Fuel Blocks`，不补空格）
+const PLURAL = /^(?:es|s)(?![A-Za-z0-9])/
+
+/**
+ * 还原被保护的内容。网址（U8）还原后不能和旁边的字粘在一起，否则 QQ 会把后面的字也算进链接：
+ * 网址后面紧跟的不是空白或行尾，补一个空格（英文标点 `.,;:!?'")]>` 除外：保护时本来就不算进网址，原文里也是这样紧挨着的）；
+ * 前面紧挨着汉字或全角标点，也补一个空格。其他占位符原样放回。
+ */
+export function restore(text: string, tokens: Array<{ token: string; value: string; url?: boolean }>): string {
+  const map = new Map(tokens.map((t) => [t.token, t]))
+  return text.replace(ANY_TOKEN, (m, offset: number) => {
+    const t = map.get(m)
+    if (!t) return m
+    if (!t.url) return t.value
+    const before = offset > 0 && CJK_EDGE.test(text[offset - 1]) ? ' ' : ''
+    const next = text[offset + m.length]
+    const after = next !== undefined && !/[\s.,;:!?'")\]>]/.test(next) ? ' ' : ''
+    return before + t.value + after
+  })
+}
 
 /**
  * 还原术语表的占位符（T7）：换进去的是中文、并且这一侧隔着空格紧挨着汉字或中文标点时，去掉这一侧的空格
  * （「当心，⟦G0⟧ 在我们的本星系」→「当心，墩子在我们的本星系」）。只去掉空格和制表符，不跨行；
- * 换进去的是英文、旁边是被保护的内容（还没还原的 ⟦0⟧ 等）或者另一个术语时，空格照旧。
+ * 换进去的是英文、旁边是被保护的内容（还没还原的 ⟦0⟧ 等）时，空格照旧。
+ * 两个术语之间只隔着空格时（U11），紧挨空格两边的字都是汉字就去掉空格（「长须鲸级 被抓」→「长须鲸级被抓」），
+ * 否则保留（「FRT 舰队」）。
+ * 换进去的是英文、这一侧紧挨着英文字母或数字、中间没有空格时（U3），补一个空格（「AAA⟦G0⟧」→「AAA Fuel Block」）；
+ * 右侧紧跟的是复数词尾 s/es 并且后面是词边界时不补（「⟦G0⟧s」→「Fuel Blocks」）。
  */
 export function restoreTerms(text: string, tokens: Array<{ token: string; value: string }>): string {
   const map = new Map(tokens.map((t) => [t.token, t.value]))
   let out = ''
   let last = 0
   let skipFrom = -1
-  // 上一个换进去的术语在 out 里的结束位置：两个术语之间的空格保留（「集结 裂谷级」）
+  // 上一个换进去的术语在 out 里的结束位置：两个术语之间的空格只在两边都是汉字时去掉（U11）
   let termEnd = -1
   for (const m of text.matchAll(ANY_TOKEN)) {
     const value = map.get(m[0])
@@ -174,11 +198,15 @@ export function restoreTerms(text: string, tokens: Array<{ token: string; value:
     if (HAN_EDGE.test(value[0] ?? '')) {
       const joined = out + between
       const trimmed = joined.replace(/[ \t]+$/, '')
-      if (trimmed !== joined && trimmed.length !== termEnd && CJK_EDGE.test(trimmed.at(-1) ?? '')) {
+      const edge = trimmed.at(-1) ?? ''
+      const afterTerm = trimmed.length === termEnd
+      if (trimmed !== joined && (afterTerm ? HAN_EDGE.test(edge) : CJK_EDGE.test(edge))) {
         out = trimmed
         between = ''
       }
     }
+    // U3：英文术语左边紧挨着英文字母或数字
+    if (ALNUM.test(value[0] ?? '') && ALNUM.test((out + between).at(-1) ?? '')) between += ' '
     out += between + value
     termEnd = out.length
     last = m.index! + m[0].length
@@ -189,6 +217,8 @@ export function restoreTerms(text: string, tokens: Array<{ token: string; value:
       while (text[k] === ' ' || text[k] === '\t') k++
       if (k > last && CJK_EDGE.test(text[k] ?? '')) skipFrom = last
     }
+    // U3：英文术语右边紧挨着英文字母或数字（复数词尾除外）；右边是另一个术语时由它的左侧判断
+    if (ALNUM.test(value.at(-1) ?? '') && ALNUM.test(text[last] ?? '') && !PLURAL.test(text.slice(last))) out += ' '
   }
   let rest = text.slice(last)
   if (skipFrom === last) rest = rest.replace(/^[ \t]+/, '')
