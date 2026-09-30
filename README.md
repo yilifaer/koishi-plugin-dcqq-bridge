@@ -334,7 +334,7 @@ npm run build
 ## 致谢
 
 - [Koishi](https://koishi.chat/) 和 Satori 适配器。
-- @myrtus/koishi-plugin-forward：本插件用来替换它，开发时阅读过它的代码来理解旧的行为，但没有复制它的任何代码（它是 AGPL-3.0 许可）。
+- 特别感谢 [@myrtus/koishi-plugin-forward](https://github.com/bot-myrtus/forward) 的作者。我们的 Discord 频道和 QQ 群一直靠它互通，它是这个插件的起点。后来因为我们的游戏（EVE Online）有一些特殊需要，例如舰队通知里的 @全体、embed 排版、中英机翻和游戏术语，才另外写了这个插件。开发时阅读过它的代码来理解原来的行为，但没有复制它的任何代码（它是 AGPL-3.0 许可）。向原作者致敬！
 
 ## 许可证
 
