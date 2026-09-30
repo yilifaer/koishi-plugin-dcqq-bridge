@@ -107,6 +107,7 @@ A [Koishi](https://koishi.chat/) plugin that bridges **Discord channels** and **
 | `maxPerHour` | `0` | 每小时最多请求几次，`0` = 不限 |
 | `extraBody` | 空 | 可选：额外合并进请求体的字段，写成 JSON 对象（见下） |
 | `notCommands` | `help` | 这些词开头的消息不当作命令，照常翻译；多个用 `;;` 分隔，不区分大小写 |
+| `keepValueLabels` | 空 | 这些标签后面的内容原样保留、不翻译；多个用 `;;` 分隔，不区分大小写（见下） |
 
 总开关打开但没填 `baseURL` 或 `model` 时，翻译按关闭处理，`bridge.status` 会显示原因。
 
@@ -122,6 +123,14 @@ A [Koishi](https://koishi.chat/) plugin that bridges **Discord channels** and **
 
 **`extraBody`**：服务商需要额外参数时用，写成一个 JSON 对象，原样合并进请求体，例如 `{"max_tokens": 1000}`。`model` 和 `messages` 由插件决定，写了也会被忽略。JSON 写错或不是对象（例如数组）时整项忽略，并在 `bridge.status` 里提示。
 
+**`keepValueLabels`**：人名、舰队名、语音频道名被翻译或音译后，成员就没法在游戏里搜到了。某一行以「标签 + 冒号（`:` 或 `：`）」开头、并且标签在这个列表里时，冒号后面到行尾的内容不发给模型，译文里原样放回。标签前后可以有空格，也可以是 Discord 粗体（`**FC Name:** 某人`、`**FC Name**: 某人` 都算），行首可以有列表符号 `-`；标签不在行首的不算。Discord embed 的字段名在列表里时，整个字段值都不翻译。AA 舰队 ping 的参考写法：
+
+```
+FC;;FC Name;;Fleet Commander;;Fleet Name;;Comms;;Formup Location
+```
+
+另外，提示词里要求模型不翻译、不音译玩家和角色名、军团和联盟名及其简称、舰队制式名、语音频道名；这只是要求，模型不一定每次都照做，固定格式的 ping 请用上面的标签。
+
 同时进行的翻译请求最多 4 个，其余排队；排队的时间也算在 `timeoutMs` 里，等不到就按超时处理（不发请求），只发原文。
 
 必须用服务商的 **API key**。Claude、ChatGPT 这类聊天订阅不能拿来当机器人的后端。
@@ -135,7 +144,9 @@ A [Koishi](https://koishi.chat/) plugin that bridges **Discord channels** and **
 - 译文和原文一样的（不区分大小写和空白）不附；
 - 断线后补发的消息。
 
-**不会发给翻译服务商的内容**：用户名、QQ 号、群号、频道名、文件名。提及、网址、时间、代号星系、ISK 数字会先换成占位符，翻译后再换回来。
+**不会发给翻译服务商的内容**：用户名、QQ 号、群号、频道名、文件名。提及、`@everyone`、`@here`、网址、时间、代号星系、ISK 数字、`keepValueLabels` 标签后面的内容会先换成占位符，翻译后再换回来。
+
+**零宽字符**：有的 ping 工具会在消息里插入大量看不见的零宽字符（U+200B、U+200C、U+200D、U+2060、U+FEFF），Discord → QQ 转发和翻译之前都会删掉，免得术语匹配不上。组合 emoji（例如 👨‍👩‍👧）里夹在两个 emoji 之间的 U+200D 保留。
 
 ### 过滤
 
@@ -160,11 +171,11 @@ A [Koishi](https://koishi.chat/) plugin that bridges **Discord channels** and **
 | `eve` | 关 | 使用插件自带的 EVE 官方名称表（`data/eve-glossary.json`） |
 | `systemStyle` | `en(zh)` | 有名字的星系、星域、星座在英译中时怎么写：`Jita(吉他)` / `Jita` / `吉他` |
 | `slangFile` | 空 | 黑话表文件（YAML，相对 Koishi 实例目录） |
-| `overrides` | 空 | 自己加的词条（表格），优先级最高 |
+| `overrides` | 空 | 自己加的词条（表格），优先级最高（和群里 `纠错` 命令加的词条同级，同一个原文以这里为准） |
 
 **黑话表格式**见插件自带的 [`data/eve-slang.example.yaml`](data/eve-slang.example.yaml)。每一条：
 - `en`、`zh`：标准写法；
-- `mode`：`keep` 原样保留 / `force` 一定换成对应的词 / `hint` 只作为参考交给模型；
+- `mode`：`keep` 原样保留 / `force` 一定换成对应的词 / `hint` 只作为参考交给模型（参考词条是否被采用由模型决定；想要固定的译法，请用 force）；
 - `dir`：`both` / `en2zh` / `zh2en`；
 - `en_aliases`、`zh_aliases`：其他写法，匹配到时输出标准写法；
 - `category`、`note`、`confidence`：只给人看。
@@ -178,6 +189,26 @@ A [Koishi](https://koishi.chat/) plugin that bridges **Discord channels** and **
 - 官方名称里是常用英语单词的（例如星域 Catch、Domain），只作参考，并且只在首字母大写、不在句首时匹配；
 - 两个字以内的官方中文名（例如「吉他」）在中译英时只作参考。
 
+**在群里直接纠错**：看到翻错了，在桥接的 QQ 群或 Discord 频道里发 `纠错` 命令（需要 `authority` 级权限），马上生效，不用打开控制台，也不会让插件重载。
+
+| 命令 | 作用 |
+|---|---|
+| `纠错 <原文> = <译法>` | 添加或修改一条词条，默认强制替换（force）。例如 `纠错 standing fleet = 值守舰队`，回复「已添加：standing fleet → 值守舰队（强制替换，英译中）」 |
+| `纠错 -h <原文> = <译法>` | 同上，但只作参考（hint），由模型决定用不用 |
+| `纠错 -k <原文>` | 原样保留，不翻译（keep） |
+| `纠错 列表 [关键词]` | 列出用命令加的词条；太长时分几条发 |
+| `纠错 删除 <原文>` | 删除一条（两个方向都有时一起删） |
+| `纠错 导出` | 把全部词条写成黑话表格式的 YAML，存到 Koishi 实例目录的 `data/dcqq-bridge/fixes-<时间>.yaml`，回复文件路径，方便以后并进黑话表 |
+
+- 原文、译法里可以有空格；等号写全角 `＝` 也行。英文名是 `bridge.fix`。
+- **方向自动判断**：原文有英文字母、译法有汉字 → 英译中；原文有汉字、译法有英文字母 → 中译英；判断不出来（例如两边都是英文）就回复用法，不添加。`-k` 只看原文：有汉字 → 中译英（中英混写的词也算中文），只有英文字母 → 英译中。
+- 同一个方向、同一个原文再加一次就覆盖旧的（3 个字母以上不分大小写）。
+- 加的时候和黑话表走同样的检查：原文、译法至少 2 个字；3 个字母以内的英文只匹配大小写完全一致的写法；原文是常用英语单词、又是强制替换时，回复里会提醒「可能误伤普通句子」，但照样加上，不想要就改用 `-h` 再加一次。
+- 优先级和控制台的 `overrides` 相同，高于黑话表和官方名称表。控制台 `overrides` 里有同一个原文时以控制台为准，`纠错 列表` 里会标出来。
+- 词条存在数据库里（表 `dcqqbridge_glossary`），不写进 koishi.yml。每次增删后翻译缓存都会失效，同一句话下次会按新词条重新翻译。
+- **回复一条转发过来的消息再发纠错**：加完词条后，插件从那条消息里取回原文（去掉开头的 `[桥名 - 名字]` 和后面的译文），用新词条重新翻译一次，把新译文回复在你发命令的群或频道里（不转发到对面），方便马上确认效果。重新翻译失败不影响词条本身。
+- 纠错命令和机器人的回复都不会转发到对面。
+
 ## 管理命令
 
 所有命令都需要达到 `authority` 设置的权限等级。**任何达到这个等级的人都能暂停、恢复、导入**；如果别的插件也需要给人这个等级，考虑把本插件的 `authority` 调高。
@@ -189,6 +220,7 @@ A [Koishi](https://koishi.chat/) plugin that bridges **Discord channels** and **
 | `bridge.resume [桥]`（`桥接恢复`） | 恢复；加 `-t` 只恢复翻译 |
 | `bridge.reload` | 重新读取关键词文件和黑话表 |
 | `bridge.import` | 从 @myrtus/forward 的配置生成桥（只能私聊使用，只输出、不改任何配置） |
+| `bridge.fix`（`纠错`） | 在群里加、改、删术语词条，马上生效，见上面「术语表」一节 |
 
 「桥」可以写成：`bridge.status` 里的编号、`Discord频道ID:QQ群号`、或桥名。
 
@@ -197,6 +229,22 @@ A [Koishi](https://koishi.chat/) plugin that bridges **Discord channels** and **
 统计数字只保存在内存里，插件重载后清零（在控制台保存一次配置也算重载）；`bridge.status` 第一行会写「统计从 … 重载后开始」。暂停状态保存在数据库里。
 
 `bridge.status` 里的时间按 `timezone` 显示，后面标上时区，例如 `09/30 12:38 (UTC+8)`；电脑本机的时区和它不同时不会看错。
+
+### 给账号设权限（例如在 Discord 上也能用命令）
+
+权限等级是 Koishi 自己管的，本插件不做特殊处理。**QQ 号和 Discord 账号在 Koishi 里是两个不同的用户**，QQ 号有 4 级权限，不代表 Discord 账号也有；新账号默认是 1 级。要在 Discord 频道里用 `纠错`、`bridge.status` 这些命令，需要给 Discord 账号单独设成 4 级（或者 `authority` 设置的等级）。
+
+先让这个 Discord 账号在机器人能看到的频道里发一句话，Koishi 才会给它建用户记录。然后任选一种方法：
+
+**方法一：在控制台的「数据库」页面改**（需要启用 `dataview` 插件，控制台左边栏叫「数据库」）
+1. 打开 `binding` 表，找到 `platform` 是 `discord`、`pid` 是你的 Discord 用户 ID 的那一行，记下 `aid` 那一格的数字。（Discord 用户 ID：Discord 设置 → 高级 → 打开「开发者模式」，然后右键自己的头像 →「复制用户 ID」。）
+2. 打开 `user` 表，找到 `id` 等于刚才那个数字的一行，把 `authority` 改成 `4`，保存。
+
+**方法二：用 `authorize` 命令**（`admin` 插件提供）
+- 由一个 **5 级**的账号发送：`authorize 4 -u @discord:你的Discord用户ID`，例如 `authorize 4 -u @discord:123456789012345678`（这里的数字是编造的）。
+- Koishi 规定只能给别人设比自己低的等级，所以 4 级的账号不能用这个命令把别人设成 4 级；手头没有 5 级账号时用方法一。
+
+改完后在 Discord 频道里发 `bridge.status` 试一下：有状态回复就说明设好了；权限还不够时 Koishi 会回复「权限不足。」（或者什么都不回）。
 
 ## 从 @myrtus/forward 迁移
 

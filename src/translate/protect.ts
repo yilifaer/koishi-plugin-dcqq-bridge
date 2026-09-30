@@ -17,9 +17,43 @@ const PATTERNS = [
   /\b[A-Z0-9]{1,5}-[A-Z0-9]{1,5}\b/g,
   /\bJ\d{6}\b/g,
   /\d+(?:\.\d+)?\s?[kmb]\b/gi,
+  // @everyone、@here 文字（B12）：和提及一样原样保留
+  /@(?:everyone|here)(?![\p{L}\p{N}_])/giu,
 ]
 
-type Range = [number, number]
+export type Range = [number, number]
+
+/** 标签的比较形式（B10）：去掉 Markdown 的 `*`、`_` 和末尾冒号，连续空白合成一个，小写。 */
+export function normalizeLabel(label: string): string {
+  return label.replace(/[*_]/g, '').replace(/[:：]+\s*$/, '').replace(/\s+/g, ' ').trim().toLowerCase()
+}
+
+// 行首「标签 + 冒号」：前面可以有空白、列表符号 `-`/`•` 和粗体、斜体标记（`**FC Name:** 某人`、`**FC Name**: 某人`）
+const LABEL_LINE = /^[\s*_]*(?:[-•][\s*_]+)?([^:：\n]{1,60}?)[\s*_]*[:：][\s*_]*(.*?)\s*$/d
+
+/**
+ * 不翻译的范围（B10）：
+ * - 某一行以列表里的标签 + 冒号开头：冒号后面到行尾（去掉行尾空白）；
+ * - embed 字段名在列表里：整个字段值（fields 是字段值在 text 里的位置，由渲染时给出）。
+ */
+export function keepValueRanges(text: string, labels: string[], fields: Array<{ name: string; start: number; end: number }> = []): Range[] {
+  if (!labels.length) return []
+  const set = new Set(labels)
+  const out: Range[] = []
+  for (const f of fields) {
+    if (set.has(normalizeLabel(f.name)) && f.end > f.start && text.slice(f.start, f.end).trim()) out.push([f.start, f.end])
+  }
+  let offset = 0
+  for (const line of text.split('\n')) {
+    const m = LABEL_LINE.exec(line)
+    if (m && m[2] && set.has(normalizeLabel(m[1]))) {
+      const [s, e] = m.indices![2]
+      out.push([offset + s, offset + e])
+    }
+    offset += line.length + 1
+  }
+  return out
+}
 
 function overlaps(ranges: Range[], start: number, end: number) {
   return ranges.some(([s, e]) => start < e && end > s)
@@ -34,13 +68,15 @@ function trimUrl(url: string) {
   return out
 }
 
-export function protect(text: string, spans: string[]): { text: string; tokens: Token[] } {
+/** keep：必须整段保护的范围（B10 标签后面的值），最先占用。 */
+export function protect(text: string, spans: string[], keep: Range[] = []): { text: string; tokens: Token[] } {
   const taken: Range[] = []
   const claim = (start: number, end: number) => {
     if (end <= start || overlaps(taken, start, end)) return false
     taken.push([start, end])
     return true
   }
+  for (const [s, e] of [...keep].sort((a, b) => a[0] - b[0] || b[1] - a[1])) claim(s, e)
   // 1. 提及、表情、时间等（长的优先，每一处都要）：先占，名字里带 ⟦⟧ 或网址时整段一起保护，不漏出一部分
   const list = [...new Set(spans.filter((s) => s && s.trim()))].sort((a, b) => b.length - a.length)
   for (const span of list) {

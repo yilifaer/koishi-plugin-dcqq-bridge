@@ -1,6 +1,6 @@
 {
   "name": "koishi-plugin-dcqq-bridge",
-  "version": "0.2.3",
+  "version": "0.3.0",
   "description": "Discord 频道与 QQ 群（OneBot）之间的消息转发：完整渲染 embed、换算时间码、@全体、防 ping、失败降级、可选的机器翻译与 EVE 术语表",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",

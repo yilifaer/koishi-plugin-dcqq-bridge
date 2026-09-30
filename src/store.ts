@@ -23,10 +23,26 @@ export interface StateRow {
   value: string
 }
 
+/** 纠错命令加的词条（B14）。key = 方向 + 来源写法（3 个字母以上不分大小写），同一个 key 再加就覆盖。 */
+export interface GlossaryRow {
+  key: string
+  /** 来源写法（原样） */
+  src: string
+  /** 换成的写法；keep 时和 src 相同 */
+  dst: string
+  mode: string
+  /** en2zh / zh2en */
+  dir: string
+  /** `平台:用户ID` */
+  createdBy: string
+  createdAt: Date
+}
+
 declare module 'koishi' {
   interface Tables {
     dcqqbridge_message: MessageRow
     dcqqbridge_state: StateRow
+    dcqqbridge_glossary: GlossaryRow
   }
 }
 
@@ -49,6 +65,15 @@ export function extendModels(ctx: Context) {
   ctx.model.extend('dcqqbridge_state', {
     key: 'string(128)',
     value: 'string(1024)',
+  }, { primary: 'key' })
+  ctx.model.extend('dcqqbridge_glossary', {
+    key: 'string(300)',
+    src: 'string(255)',
+    dst: 'string(255)',
+    mode: 'string(8)',
+    dir: 'string(8)',
+    createdBy: 'string(128)',
+    createdAt: 'timestamp',
   }, { primary: 'key' })
 }
 

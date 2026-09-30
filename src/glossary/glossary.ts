@@ -191,6 +191,25 @@ function makeCandidate(t: RawTerm): Candidate {
   }
 }
 
+/** overrides、黑话表、纠错词条共用的检查：有问题返回原因（不带「已跳过」），没问题返回 null。 */
+export function userTermProblem(raw: { en?: unknown; zh?: unknown; mode?: unknown; dir?: unknown }): string | null {
+  const en = typeof raw.en === 'string' ? raw.en.trim() : ''
+  const zh = typeof raw.zh === 'string' ? raw.zh.trim() : ''
+  if (!en || !zh) return '缺少 en 或 zh'
+  if (!MODES.includes(raw.mode as GlossaryMode)) return `mode 无效（${String(raw.mode)}）`
+  if (!DIRS.includes(raw.dir as GlossaryDir)) return `dir 无效（${String(raw.dir)}）`
+  if (charLength(en) < MIN_LENGTH || charLength(zh) < MIN_LENGTH) return `en 或 zh 少于 ${MIN_LENGTH} 个字`
+  return null
+}
+
+/**
+ * 来源写法的匹配限制（和 buildGlossary 里的规则一致，给纠错命令的提醒用）：
+ * exact = 3 个字母以内，只匹配大小写完全一致的写法；common = 常用英语单词。
+ */
+export function sourceTraits(source: string, commonWords: Set<string>): { exact: boolean; common: boolean } {
+  return { exact: letterCount(source) <= 3, common: commonWords.has(source.trim().toLowerCase()) }
+}
+
 export function buildGlossary(options: GlossaryOptions, sources: GlossarySources): { glossary: Glossary; warnings: string[] } {
   const warnings: string[] = []
   const terms: Record<Direction, RawTerm[]> = { en2zh: [], zh2en: [] }
@@ -204,12 +223,8 @@ export function buildGlossary(options: GlossaryOptions, sources: GlossarySources
     const en = typeof raw.en === 'string' ? raw.en.trim() : ''
     const zh = typeof raw.zh === 'string' ? raw.zh.trim() : ''
     const label = en ? `${where}（${en}）` : where
-    if (!en || !zh) return void warnings.push(`${label}：缺少 en 或 zh，已跳过`)
-    if (!MODES.includes(raw.mode as GlossaryMode)) return void warnings.push(`${label}：mode 无效（${String(raw.mode)}），已跳过`)
-    if (!DIRS.includes(raw.dir as GlossaryDir)) return void warnings.push(`${label}：dir 无效（${String(raw.dir)}），已跳过`)
-    if (charLength(en) < MIN_LENGTH || charLength(zh) < MIN_LENGTH) {
-      return void warnings.push(`${label}：en 或 zh 少于 ${MIN_LENGTH} 个字，已跳过`)
-    }
+    const problem = userTermProblem(raw)
+    if (problem) return void warnings.push(`${label}：${problem}，已跳过`)
     const mode = raw.mode as GlossaryMode
     const dir = raw.dir as GlossaryDir
     const hint = `${en} => ${zh}`
@@ -236,6 +251,8 @@ export function buildGlossary(options: GlossaryOptions, sources: GlossarySources
   }
 
   ;(options.overrides ?? []).forEach((o, i) => addUser(o ?? {}, `术语覆盖第 ${i + 1} 条`, PRIORITY.override))
+  // 纠错命令的词条和 overrides 同级，排在后面：同一个原文以控制台为准（去重时留先加入的）
+  ;(sources.fixes ?? []).forEach((s) => addUser(s ?? {}, '纠错词条', PRIORITY.override))
   ;(sources.slang ?? []).forEach((s, i) => addUser(s ?? {}, `黑话表第 ${i + 1} 条`, PRIORITY.slang))
 
   // 官方名称表：默认 force，按规则降级成 hint

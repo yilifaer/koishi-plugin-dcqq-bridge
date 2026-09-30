@@ -3,6 +3,7 @@
 import { INVALID_ROW_KEY } from './config'
 import type { AtAllConfig, BridgeRow, Config, Direction, GlossaryDir, GlossaryMode } from './config'
 import { isValidTimeZone } from './discord/timestamp'
+import { normalizeLabel } from './translate/protect'
 
 export interface Bridge {
   /** 在 bridges 列表里的位置（从 1 开始，只用来显示）。 */
@@ -48,6 +49,8 @@ export interface TranslateSettings {
   extraBody: Record<string, unknown>
   /** 不算命令的词（小写）。 */
   notCommands: string[]
+  /** 冒号后面内容不翻译的标签（小写，连续空白合成一个）。 */
+  keepValueLabels: string[]
 }
 
 export interface FilterSettings {
@@ -165,6 +168,7 @@ export function normalizeSettings(config: Partial<Config>): Settings {
     maxPerHour: clampInt(tr.maxPerHour, 0, 0, 1000000),
     extraBody: parseExtraBody(text(tr.extraBody), problems),
     notCommands: [...new Set(text(tr.notCommands, 'help').split(';;').map((w) => w.trim().toLowerCase()).filter(Boolean))],
+    keepValueLabels: [...new Set(text(tr.keepValueLabels).split(';;').map(normalizeLabel).filter(Boolean))],
   }
   if (translate.enabled && (!translate.baseURL || !translate.model)) {
     problems.push('翻译已打开，但没有填接口地址或模型，按关闭处理')

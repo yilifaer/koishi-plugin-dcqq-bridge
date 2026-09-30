@@ -8,9 +8,10 @@ import type { Context } from 'koishi'
 import type { Settings } from '../bridges'
 import { KeywordFilter, Moderator, parseKeywordLines, resolveModerationKey } from '../filter'
 import { buildGlossary, Glossary, loadCommonWords, loadEveData, parseSlangYaml } from '../glossary'
+import { fixToEntry, loadFixRows } from '../fixes'
 import type { Msg } from '../types'
 import { Translator } from './client'
-import { protect, restore, stripTokens } from './protect'
+import { keepValueRanges, protect, restore, stripTokens } from './protect'
 import { isCommand, rootPrefixes, skipReason } from './skip'
 
 export type TranslateDirection = 'en2zh' | 'zh2en'
@@ -111,10 +112,17 @@ export class TranslationService {
       eveData = loadEveData()
       if (!eveData) problems.push('插件自带的 EVE 名称表读不到')
     }
+    // 纠错命令加的词条（B14），存在数据库里
+    let fixes = null
+    try {
+      if (this.ctx.database) fixes = (await loadFixRows(this.ctx)).map(fixToEntry)
+    } catch (e: any) {
+      problems.push(`纠错词条读不到：${e?.message ?? e}`)
+    }
     try {
       const built = buildGlossary(
         { eve: s.glossary.eve, systemStyle: s.glossary.systemStyle, overrides: s.glossary.overrides },
-        { eveData, slang, commonWords: loadCommonWords() },
+        { eveData, slang, fixes, commonWords: loadCommonWords() },
       )
       this.glossary = built.glossary
       problems.push(...built.warnings.map((w) => `术语表：${w}`))
@@ -156,7 +164,9 @@ export class TranslationService {
     if (this.keywords?.matches(source)) return this.skip('关键词命中原文')
     const notCommands = this.getSettings().translate.notCommands
     if (isCommand(source, this.prefixes(), (word) => this.ctx.$commander.resolve(word), notCommands)) return this.skip('命令')
-    const guarded = protect(source, msg.protect ?? [])
+    // B10：标签后面的值、指定 embed 字段的值整段不翻译（字段位置按 translatable 算，只在没被裁剪时用）
+    const fields = source === msg.translatable ? msg.fields : undefined
+    const guarded = protect(source, msg.protect ?? [], keepValueRanges(source, this.getSettings().translate.keepValueLabels, fields))
     const applied = this.glossary?.apply(guarded.text, direction) ?? { text: guarded.text, tokens: [], hints: [] }
     const stripped = stripTokens(applied.text)
     // 跳过判断只去掉保护用的占位符：术语（例如 Jita、Rifter）要算作文字
@@ -170,7 +180,9 @@ export class TranslationService {
       if (!local || normalizeForCompare(local) === normalizeForCompare(source)) return this.skip('只有术语')
       return this.finish(local, stripTokens(restore(applied.text, applied.tokens)), source, null)
     }
-    const key = createHash('sha1').update(`${direction}\n${this.glossary?.version ?? ''}\n${source.replace(/\s+/g, ' ')}`).digest('hex')
+    // 保留标签改了之后译文也要重新生成，所以一起算进缓存 key
+    const labels = this.getSettings().translate.keepValueLabels.join(';;')
+    const key = createHash('sha1').update(`${direction}\n${this.glossary?.version ?? ''}\n${labels}\n${source.replace(/\s+/g, ' ')}`).digest('hex')
     const cached = this.cache.get(key)
     if (cached && this.now() - cached.at < CACHE_TTL) {
       this.cache.delete(key)

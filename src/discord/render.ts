@@ -2,6 +2,7 @@
 import type { Media, Msg, ReplyInfo } from '../types'
 import { renderContent, type ContentEnv } from './markdown'
 import { formatTimestamp } from './timestamp'
+import { stripZeroWidth } from '../text/invisible'
 
 // 只取用到的字段，全部可选，宽松对待网关数据（R3：不从适配器导入运行时代码）
 export interface RawUser {
@@ -180,8 +181,8 @@ function imageMedia(urls: string[], name = '', extra: Partial<Media> = {}): Medi
   return { kind: 'image', urls, name, placeholder: '[图片]', ...extra }
 }
 
-/** 一个 embed → 文字块（§7.2）。链接预览返回 null。图片放进 media；标题、描述、字段名和值另外放进 tr（翻译输入）。 */
-function renderEmbed(e: RawEmbed, env: ContentEnv, media: Media[], tr: string[]): string | null {
+/** 一个 embed → 文字块（§7.2）。链接预览返回 null。图片放进 media；标题、描述、字段名和值另外放进 tr（翻译输入），字段值在 tr 里的位置 → 字段名记进 fieldOf。 */
+function renderEmbed(e: RawEmbed, env: ContentEnv, media: Media[], tr: string[], fieldOf: Map<number, string>): string | null {
   if (e.type && e.type !== 'rich') return null
   const lines: string[] = []
   if (e.author?.name) lines.push(e.author.name)
@@ -193,7 +194,9 @@ function renderEmbed(e: RawEmbed, env: ContentEnv, media: Media[], tr: string[])
   for (const f of e.fields ?? []) {
     const name = renderContent(f.name ?? '', env)
     const raw = renderContent(f.value ?? '', env)
-    tr.push(name, raw)
+    tr.push(name)
+    fieldOf.set(tr.length, name)
+    tr.push(raw)
     // 字段值有换行：换行后缩进两个空格
     const value = raw.replace(/\n/g, '\n  ')
     if (name || value) lines.push(`${name}：${value}`)
@@ -340,10 +343,10 @@ export function collectRefs(d: RawMessage): { roles: string[]; channels: string[
 }
 
 /** 渲染一条消息的 embed 和组件，返回文字块。 */
-function renderRich(m: RawSnapshotMessage, env: ContentEnv, media: Media[], hasOther: boolean, tr: string[]): string[] {
+function renderRich(m: RawSnapshotMessage, env: ContentEnv, media: Media[], hasOther: boolean, tr: string[], fieldOf: Map<number, string>): string[] {
   const blocks: string[] = []
   for (const e of m.embeds ?? []) {
-    const b = renderEmbed(e, env, media, tr)
+    const b = renderEmbed(e, env, media, tr, fieldOf)
     if (b) blocks.push(b)
   }
   if (m.components?.length) {
@@ -363,6 +366,7 @@ export function renderDiscordMessage(d: RawMessage, opts: RenderOptions): Msg | 
   if (!FORWARDED_TYPES.has(d.type ?? 0)) return null
   // 翻译输入的片段、渲染出的受保护记号（回复不收集）
   const tr: string[] = []
+  const fieldOf = new Map<number, string>()
   const tokens: string[] = []
   const onToken = (s: string) => { tokens.push(s) }
   const env = envFor(d.mentions, opts, true, onToken)
@@ -383,7 +387,7 @@ export function renderDiscordMessage(d: RawMessage, opts: RenderOptions): Msg | 
   renderStickers(d.sticker_items, media, tail)
   const hasOther = body.trim() !== '' || media.length > 0 || tail.length > 0
     || (d.embeds ?? []).some((e) => !e.type || e.type === 'rich')
-  blocks.push(...renderRich(d, env, media, hasOther, tr))
+  blocks.push(...renderRich(d, env, media, hasOther, tr, fieldOf))
 
   // 转发的消息：`[转发的消息]` 开头，快照没有作者；不做回复查找
   if (d.message_reference?.type === 1) {
@@ -399,13 +403,17 @@ export function renderDiscordMessage(d: RawMessage, opts: RenderOptions): Msg | 
       renderStickers(m.sticker_items, media, lines)
       const other = !!content.trim() || lines.length > 0 || !!m.attachments?.length || !!m.sticker_items?.length
         || (m.embeds ?? []).some((e) => !e.type || e.type === 'rich')
-      const rich = renderRich(m, senv, media, other, tr)
+      const rich = renderRich(m, senv, media, other, tr, fieldOf)
       const head = parts.join('\n')
       blocks.push([head, ...rich, ...(lines.length ? [lines.join('\n')] : [])].join('\n\n'))
     }
   }
 
   if (tail.length) blocks.push(tail.join('\n'))
+
+  // 零宽字符（B11）：转发的文字和翻译输入里都删掉
+  body = stripZeroWidth(body)
+  for (let i = 0; i < blocks.length; i++) blocks[i] = stripZeroWidth(blocks[i])
 
   if (!body.trim() && !blocks.length && !media.length) return null
 
@@ -417,15 +425,25 @@ export function renderDiscordMessage(d: RawMessage, opts: RenderOptions): Msg | 
       reply = { messageId, author: '', content: '', deleted: true }
     } else if (r) {
       const content = renderContent(r.content ?? '', envFor(r.mentions, opts)).trim() || replyFallback(r)
-      reply = { messageId, author: authorName(r), content, deleted: false }
+      reply = { messageId, author: stripZeroWidth(authorName(r)), content: stripZeroWidth(content), deleted: false }
     } else {
       reply = { messageId, author: '', content: '', deleted: false }
     }
   }
 
-  const translatable = tr.map((t) => t.trim()).filter(Boolean).join('\n\n')
+  // 翻译输入：各段去掉零宽字符后用空行连起来；记下每个 embed 字段值的位置（B10）
+  let translatable = ''
+  const fields: NonNullable<Msg['fields']> = []
+  tr.forEach((t, i) => {
+    const part = stripZeroWidth(t).trim()
+    if (!part) return
+    if (translatable) translatable += '\n\n'
+    const name = fieldOf.get(i)
+    if (name !== undefined) fields.push({ name: stripZeroWidth(name), start: translatable.length, end: translatable.length + part.length })
+    translatable += part
+  })
   // 去重，只留真的出现在翻译输入里的
-  const protect = [...new Set(tokens)].filter((t) => t !== '' && translatable.includes(t))
+  const protect = [...new Set(tokens.map(stripZeroWidth))].filter((t) => t !== '' && translatable.includes(t))
 
   const ts = d.timestamp ? Date.parse(d.timestamp) : NaN
   return {
@@ -434,7 +452,7 @@ export function renderDiscordMessage(d: RawMessage, opts: RenderOptions): Msg | 
     messageId: d.id,
     guildId: d.guild_id,
     authorId: d.author?.id ?? '',
-    author: authorName(d),
+    author: stripZeroWidth(authorName(d)),
     body,
     blocks,
     media,
@@ -446,5 +464,6 @@ export function renderDiscordMessage(d: RawMessage, opts: RenderOptions): Msg | 
     checkText: [body, ...blocks, ...names].filter((s) => s !== '').join('\n'),
     translatable,
     protect,
+    ...(fields.length ? { fields } : {}),
   }
 }

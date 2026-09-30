@@ -45,6 +45,8 @@ export interface TranslateConfig {
   extraBody: string
   /** 不算命令的词，;; 分隔（B9）。 */
   notCommands: string
+  /** 冒号后面的内容不翻译的行首标签，;; 分隔（B10）。 */
+  keepValueLabels: string
 }
 
 export interface FilterConfig {
@@ -158,6 +160,8 @@ export const Config: Schema<Config> = Schema.intersect([
         .description('可选：额外合并进请求体的字段，写成 JSON 对象，例如 `{"max_tokens": 1000}`。不能覆盖 `model` 和 `messages`。写错时忽略，并在 `bridge.status` 里提示。'),
       notCommands: str('help')
         .description('这些词开头的消息不当作命令（照常翻译），多个用 `;;` 分隔，不区分大小写。只有第一个词是命令、并且整条消息不超过 3 个词时才当作命令不翻译。'),
+      keepValueLabels: str()
+        .description('可选：这些标签后面的内容原样保留、不翻译，多个用 `;;` 分隔，不区分大小写。某一行以「标签 + 冒号」开头（例如 `FC Name: 某人`）时，冒号后面到行尾的内容不发给模型；Discord embed 的字段名是这些标签时，整个字段值也不翻译。适合人名、舰队名、语音频道名。'),
     }).default({} as TranslateConfig).loose(),
   }).description('翻译'),
 
