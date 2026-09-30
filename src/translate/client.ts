@@ -9,6 +9,8 @@ export interface TranslatorConfig {
   maxPerHour: number
   /** 额外合并进请求体的字段（已解析好的对象，B7）；不能覆盖 model、messages。 */
   extraBody?: Record<string, unknown>
+  /** 背景说明（U2）：不为空时加在系统提示词最后。 */
+  context?: string
 }
 
 /** 同时进行的翻译请求最多几个（B4）；排队的仍受 timeoutMs 限制（从提交时算）。 */
@@ -32,6 +34,12 @@ const RULES = '只翻译 <text> 和 </text> 之间的内容。形如 ⟦0⟧、�
 const SYSTEM: Record<TranslateInput['direction'], string> = {
   en2zh: `你是翻译引擎，把英文翻译成简体中文。${RULES}`,
   zh2en: `你是翻译引擎，把中文翻译成英文。${RULES}`,
+}
+
+/** 系统提示词：背景说明（U2）不为空时原样加在最后，两个方向都加。 */
+export function systemPrompt(direction: TranslateInput['direction'], context?: string): string {
+  const extra = (context ?? '').trim()
+  return extra ? `${SYSTEM[direction]}\n\n${extra}` : SYSTEM[direction]
 }
 
 // 只认针对翻译任务本身的拒绝，不用「抱歉」「I can't」这类普通说法
@@ -220,7 +228,7 @@ export class Translator {
       ...(config.extraBody ?? {}),
       model: config.model,
       messages: [
-        { role: 'system', content: SYSTEM[input.direction] },
+        { role: 'system', content: systemPrompt(input.direction, config.context) },
         { role: 'user', content: user },
       ],
     }

@@ -13,6 +13,7 @@ import { fixToEntry, loadFixRows } from '../fixes'
 import type { Msg } from '../types'
 import { Translator } from './client'
 import { keepValueRanges, protect, restore, restoreTerms, stripTokens } from './protect'
+import { MemberNames, protectedNameRanges } from './names'
 import { isCommand, isRealCommand, rootPrefixes, skipReason } from './skip'
 
 export type TranslateDirection = 'en2zh' | 'zh2en'
@@ -30,8 +31,15 @@ function normalizeForCompare(text: string) {
   return text.trim().replace(/\s+/g, ' ').toLowerCase()
 }
 
+/** 译文去掉首尾空白，并且每行去掉行尾空白（U9：模型有时按 Markdown 的写法在行尾加两个空格）。 */
+export function trimLines(text: string) {
+  return text.replace(/[^\S\n]+$/gm, '').trim()
+}
+
 export class TranslationService {
   glossary: Glossary | null = null
+  /** QQ 群成员名片缓存（U7），由 Relay 设置。 */
+  memberNames: MemberNames | null = null
   keywords: KeywordFilter | null = null
   /** 读取关键词、术语表时的问题（给 bridge.status 显示）。 */
   problems: string[] = []
@@ -55,7 +63,7 @@ export class TranslationService {
   ) {
     this.translator = new Translator(ctx.http, () => {
       const t = this.getSettings().translate
-      return { baseURL: t.baseURL, apiKey: t.apiKey, model: t.model, timeoutMs: t.timeoutMs, maxPerHour: t.maxPerHour, extraBody: t.extraBody }
+      return { baseURL: t.baseURL, apiKey: t.apiKey, model: t.model, timeoutMs: t.timeoutMs, maxPerHour: t.maxPerHour, extraBody: t.extraBody, context: t.context }
     }, now)
     this.moderator = new Moderator(ctx.http, () => {
       const s = this.getSettings()
@@ -177,7 +185,10 @@ export class TranslationService {
     if (isCommand(source, this.prefixes(), (word) => isRealCommand(this.ctx.$commander.resolve(word)), notCommands)) return this.skip('命令')
     // B10：标签后面的值、指定 embed 字段的值整段不翻译（字段位置按 translatable 算，只在没被裁剪时用）
     const fields = source === msg.translatable ? msg.fields : undefined
-    const guarded = protect(source, msg.protect ?? [], keepValueRanges(source, this.getSettings().translate.keepValueLabels, fields))
+    // U6、U7：dotlan 链接里的军团名、建筑通知里的建筑名、QQ 群友名片里的名字也整段保护（只影响翻译输入）
+    const members = direction === 'zh2en' && msg.platform === 'onebot' && this.getSettings().translate.protectMemberNames ? this.memberNames?.cards(msg.channelId) : undefined
+    const names = protectedNameRanges(source, { direction, glossary: this.glossary, spans: msg.protect, members })
+    const guarded = protect(source, msg.protect ?? [], [...keepValueRanges(source, this.getSettings().translate.keepValueLabels, fields), ...names])
     const applied = this.glossary?.apply(guarded.text, direction) ?? { text: guarded.text, tokens: [], hints: [] }
     const stripped = stripTokens(applied.text)
     // 跳过判断只去掉保护用的占位符：术语（例如 Jita、Rifter）要算作文字
@@ -187,13 +198,15 @@ export class TranslationService {
     if (this.moderationKeyMissing()) return this.skip('审核未配置密钥')
     // B3：去掉所有占位符（保护 + 术语）后没有文字 → 不请求服务商；术语换完后和原文不同就本地生成译文
     if (!HAN_OR_LETTER.test(stripped)) {
-      const local = restore(restoreTerms(applied.text, applied.tokens), guarded.tokens).trim()
+      const local = trimLines(restore(restoreTerms(applied.text, applied.tokens), guarded.tokens))
       if (!local || normalizeForCompare(local) === normalizeForCompare(source)) return this.skip('只有术语')
       return this.finish(local, stripTokens(restoreTerms(applied.text, applied.tokens)), source, null)
     }
-    // 保留标签改了之后译文也要重新生成，所以一起算进缓存 key
+    // 保留标签、背景说明（U2）改了之后译文也要重新生成，所以一起算进缓存 key
+    // 被保护的内容（名片、建筑名等）变了，发给模型的文字就不同，所以 guarded.text 也算进 key
     const labels = this.getSettings().translate.keepValueLabels.join(';;')
-    const key = createHash('sha1').update(`${direction}\n${this.glossary?.version ?? ''}\n${labels}\n${source.replace(/\s+/g, ' ')}`).digest('hex')
+    const context = createHash('sha1').update(this.getSettings().translate.context ?? '').digest('hex')
+    const key = createHash('sha1').update(`${direction}\n${this.glossary?.version ?? ''}\n${labels}\n${context}\n${guarded.text.replace(/\s+/g, ' ')}\n${source.replace(/\s+/g, ' ')}`).digest('hex')
     const cached = this.cache.get(key)
     if (cached && this.now() - cached.at < CACHE_TTL) {
       this.cache.delete(key)
@@ -218,7 +231,7 @@ export class TranslationService {
       }
       return this.fail(result.reason)
     }
-    const text = restore(restoreTerms(result.text, applied.tokens), guarded.tokens).trim()
+    const text = trimLines(restore(restoreTerms(result.text, applied.tokens), guarded.tokens))
     // 送审的文字不带被保护的内容（用户名、QQ 号、网址等），只还原术语
     return this.finish(text, stripTokens(restoreTerms(result.text, applied.tokens)), source, key)
   }

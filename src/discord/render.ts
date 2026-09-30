@@ -369,6 +369,11 @@ function renderRich(m: RawSnapshotMessage, env: ContentEnv, media: Media[], hasO
   return blocks
 }
 
+/** 只有空白的行变成空行（U9）。 */
+function blankLines(text: string) {
+  return text.replace(/^[^\S\n]+$/gm, '')
+}
+
 /** Discord 原始消息 → Msg。不转发的类型、渲染后全空的消息返回 null。 */
 export function renderDiscordMessage(d: RawMessage, opts: RenderOptions): Msg | null {
   if (!FORWARDED_TYPES.has(d.type ?? 0)) return null
@@ -419,9 +424,9 @@ export function renderDiscordMessage(d: RawMessage, opts: RenderOptions): Msg | 
 
   if (tail.length) blocks.push(tail.join('\n'))
 
-  // 零宽字符（B11）：转发的文字和翻译输入里都删掉
-  body = stripZeroWidth(body)
-  for (let i = 0; i < blocks.length; i++) blocks[i] = stripZeroWidth(blocks[i])
+  // 零宽字符（B11）：转发的文字和翻译输入里都删掉。只有空白的行（例如 AA ping 里用来空一行的 `** **`）当成空行（U9）
+  body = blankLines(stripZeroWidth(body))
+  for (let i = 0; i < blocks.length; i++) blocks[i] = blankLines(stripZeroWidth(blocks[i]))
 
   if (!body.trim() && !blocks.length && !media.length) return null
 

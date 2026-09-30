@@ -47,6 +47,10 @@ export interface TranslateConfig {
   notCommands: string
   /** 冒号后面的内容不翻译的行首标签，;; 分隔（B10）。 */
   keepValueLabels: string
+  /** 加在系统提示词最后的背景说明（U2），多行文字。 */
+  context: string
+  /** 中译英时保护 QQ 群成员名片里的名字（U7）。 */
+  protectMemberNames: boolean
 }
 
 export interface FilterConfig {
@@ -162,6 +166,10 @@ export const Config: Schema<Config> = Schema.intersect([
         .description('这些词开头的消息不当作命令（照常翻译），多个用 `;;` 分隔，不区分大小写。只有第一个词是命令、并且整条消息不超过 3 个词时才当作命令不翻译。'),
       keepValueLabels: str()
         .description('可选：这些标签后面的内容原样保留、不翻译，多个用 `;;` 分隔，不区分大小写。某一行以「标签 + 冒号」开头（例如 `FC Name: 某人`）时，冒号后面到行尾的内容不发给模型；Discord embed 的字段名是这些标签时，整个字段值也不翻译。适合人名、舰队名、语音频道名。'),
+      context: Schema.string().role('textarea').default('').loose()
+        .description('可选：给模型的背景说明，原样加在系统提示词的最后（英译中、中译英都加）。可以写聊天的场景和常见说法，例如「这是某游戏玩家之间的聊天，X = Y」。README 里有 EVE 用的参考写法。改了以后翻译缓存自动失效。'),
+      protectMemberNames: bool(true)
+        .description('中译英时，QQ 群成员名片里的名字原样保留、不翻译（例如名片 `[ABC]某角色-小鱼干` 里的「小鱼干」）。只保护 3 个字及以上、含汉字的一段。成员名片每小时在后台更新一次，插件刚启动时的头几条消息可能还没有名片。'),
     }).default({} as TranslateConfig).loose(),
   }).description('翻译'),
 

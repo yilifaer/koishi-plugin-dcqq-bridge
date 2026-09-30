@@ -22,7 +22,7 @@ describe('buildQQSends', () => {
     for (const el of sends[0]) expect(typeof el).toBe('object')
   })
 
-  it('顺序：quote → @全体 → 前缀 → 引用行 → 正文 → 图片', () => {
+  it('顺序：quote → @全体 → 前缀 → 引用行 → 正文 → 图片 → 译文（一条放得下时，U10）', () => {
     const sends = buildQQSends({
       ...base,
       quoteId: '42',
@@ -34,10 +34,10 @@ describe('buildQQSends', () => {
     })
     expect(sends).toHaveLength(1)
     const [send] = sends
-    expect(types(send)).toEqual(['quote', 'at', 'text', 'img', 'img'])
+    expect(types(send)).toEqual(['quote', 'at', 'text', 'img', 'img', 'text'])
     expect(send[0].attrs.id).toBe('42')
     expect(send[1].attrs.type).toBe('all')
-    expect(textOf(send)).toBe('\n[测试桥 - 小红]\n↪ 回复 A：原文\n正文\n\n【机翻】译文\n[图片]')
+    expect(textOf(send)).toBe('\n[测试桥 - 小红]\n↪ 回复 A：原文\n正文\n[图片]\n【机翻】译文')
     expect(send[3].attrs.src).toMatch(/^data:image\/png;base64,/)
   })
 

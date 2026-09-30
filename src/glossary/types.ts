@@ -11,7 +11,11 @@ export interface EveEntry {
   en: string
   zh: string
   kind: 'type' | 'group' | 'category' | 'system' | 'region' | 'constellation'
+  /** 只有物品带：ship = SDE 舰船类别（6），structure = 建筑类别（65）；其他类别不写 */
+  cat?: EveTypeCat
 }
+
+export type EveTypeCat = 'ship' | 'structure'
 
 export interface EveData {
   buildNumber: number
