@@ -3,6 +3,7 @@ export type {
   GlossaryMode, GlossaryDir, Direction, SystemStyle, EveEntry, EveData, SlangEntry,
   GlossaryOptions, GlossarySources, GlossaryApplication,
 } from './types'
-export { parseSlangYaml } from './slang'
+export { mergeSlangFiles, parseSlangYaml, splitSlangPaths } from './slang'
+export type { SlangFileResult, SlangFileSummary } from './slang'
 export { buildGlossary, Glossary, sourceTraits, userTermProblem } from './glossary'
 export { loadCommonWords, loadEveData } from './load'

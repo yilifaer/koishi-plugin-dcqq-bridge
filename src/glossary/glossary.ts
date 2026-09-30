@@ -253,7 +253,7 @@ export function buildGlossary(options: GlossaryOptions, sources: GlossarySources
   ;(options.overrides ?? []).forEach((o, i) => addUser(o ?? {}, `术语覆盖第 ${i + 1} 条`, PRIORITY.override))
   // 纠错命令的词条和 overrides 同级，排在后面：同一个原文以控制台为准（去重时留先加入的）
   ;(sources.fixes ?? []).forEach((s) => addUser(s ?? {}, '纠错词条', PRIORITY.override))
-  ;(sources.slang ?? []).forEach((s, i) => addUser(s ?? {}, `黑话表第 ${i + 1} 条`, PRIORITY.slang))
+  ;(sources.slang ?? []).forEach((s, i) => addUser(s ?? {}, sources.slangWhere?.[i] ?? `黑话表第 ${i + 1} 条`, PRIORITY.slang))
 
   // 官方名称表：默认 force，按规则降级成 hint
   const eve = options.eve ? sources.eveData : null

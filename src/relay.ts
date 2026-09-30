@@ -40,6 +40,10 @@ const ALIVE_INTERVAL = 60000
 const MEMBER_TIMEOUT = 5000
 /** 群成员名字查询超时后，这么久之内不再查。 */
 const MEMBER_SLOW_TTL = 60000
+/** 频道信息查询超时。 */
+const CHANNEL_TIMEOUT = 10000
+/** 频道信息查询超时或出错后，这么久之内不再查（F4）。 */
+const CHANNEL_FAIL_TTL = 60000
 
 export interface RelayOptions {
   now?: () => number
@@ -99,6 +103,8 @@ export class Relay {
   private readyReceived = false
   private roleNames = new TtlCache<Map<string, string>>(NAME_TTL)
   private channelInfo = new TtlCache<{ name?: string; guildId?: string }>(NAME_TTL)
+  /** 查不到的频道（超时、出错）：短时间内不再查。 */
+  private channelFailed: TtlCache<{ name?: string; guildId?: string }>
   private memberNames = new TtlCache<string>(NAME_TTL)
   private memberSlow = new TtlCache<true>(MEMBER_SLOW_TTL)
   private guildOf = new Map<string, string>()
@@ -110,6 +116,8 @@ export class Relay {
   private loaded: Promise<void>
   private resolveLoaded!: () => void
   private starting: Promise<void> | null = null
+  /** load() 已经读完（dispose 时只有读完了才做最后一次写入，F2）。 */
+  private loadedDone = false
   private checkTimer: NodeJS.Timeout | null = null
   private dateOf: (ms: number) => string
   private sleep?: RelayOptions['sleep']
@@ -118,6 +126,7 @@ export class Relay {
     this.logger = ctx.logger('dcqq-bridge')
     this.now = options.now ?? Date.now
     this.sleep = options.sleep
+    this.channelFailed = new TtlCache(CHANNEL_FAIL_TTL, this.now)
     this.settings = normalizeSettings(config)
     this.store = new Store(ctx)
     this.stats = new Stats(this.now)
@@ -125,9 +134,9 @@ export class Relay {
     this.dateOf = dateIn(this.settings.timeZone)
     this.gate = new AtAllGate(this.store, () => this.settings.atAll, this.dateOf, this.now)
     this.translation = new TranslationService(ctx, () => this.settings, this.logger, this.now)
+    // 无效的行已经在 problems 里（F5），不再单独写一遍
     for (const problem of this.settings.problems) this.logger.warn(problem)
     for (const row of this.settings.rows) {
-      if (row.invalid) this.logger.warn(`第 ${row.index} 行桥无效，已跳过：${row.invalid}`)
       for (const warning of row.warnings) this.logger.warn(`第 ${row.index} 行：${warning}`)
     }
     // 暂停状态、lastseen 读完之前，用到它们的地方都要等（start() 读完后 resolve）
@@ -176,6 +185,7 @@ export class Relay {
   private async doStart() {
     await this.load()
     this.startedAt = this.now()
+    this.loadedDone = true
     this.resolveLoaded()
     if (this.options.timers !== false) {
       this.ctx.setInterval(() => void this.flushLastseen().catch(() => {}), 10000)
@@ -188,7 +198,11 @@ export class Relay {
     const bot = this.discordBot()
     if (!this.readyReceived && !this.disposed && bot?.status === Universal.Status.ONLINE && bot.selfId) {
       await this.prepareWebhooks(bot)
-      for (const channel of this.backfillChannels()) await this.resetLastseen(bot, channel)
+      for (const channel of this.backfillChannels()) {
+        // 重载得很快时，旧实例这个循环可能还在跑：已经 dispose 就停（F2）
+        if (this.disposed) return
+        await this.resetLastseen(bot, channel)
+      }
     }
     this.scheduleSelfCheck()
     await this.heartbeat().catch(() => {})
@@ -253,8 +267,9 @@ export class Relay {
     this.disposed = true
     this.abort.abort()
     if (this.checkTimer) clearTimeout(this.checkTimer)
-    if (this.starting) {
-      await this.flushLastseen().catch(() => {})
+    // 最后一次写入：dispose 之后其他地方都不再写 lastseen（F2）
+    if (this.starting && this.loadedDone) {
+      await this.flushLastseen(true).catch(() => {})
       await this.store.set('alive', this.now()).catch(() => {})
     }
   }
@@ -415,11 +430,17 @@ export class Relay {
     this.lastseenDirty.add(channelId)
   }
 
-  async flushLastseen() {
+  /** 把改过的 lastseen 写进数据库。dispose 之后只有 dispose 自己的那一次（final）会写（F2）。 */
+  async flushLastseen(final = false) {
     await this.loaded
-    const dirty = [...this.lastseenDirty]
-    this.lastseenDirty.clear()
-    for (const channel of dirty) {
+    if (this.disposed && !final) return
+    const wanted = new Set(this.backfillChannels())
+    for (const channel of [...this.lastseenDirty]) {
+      // 没写的留给 dispose 的最后一次
+      if (this.disposed && !final) return
+      this.lastseenDirty.delete(channel)
+      // 不再对应启用的 d2q/both 桥的频道不写（新配置里删掉的键不能被写回去）
+      if (!wanted.has(channel)) continue
       const id = this.lastseen.get(channel)
       if (!id) continue
       await this.store.set(`lastseen:${channel}`, id)
@@ -584,7 +605,7 @@ export class Relay {
         // 已经 dispose：不再做 @全体 决定（A1）
         if (this.disposed) return
         if (!bot || !qqOnline(bot)) atAll = { ok: false, reason: '查询失败' }
-        else atAll = await this.gate.decide(bot, bridge.qq, msg)
+        else atAll = await this.gate.decide(bot, bridge.qq, msg, deadline)
         // 在发送之前就记下次数；已经超时或记不下来时改发文字
         if (atAll.ok && this.now() >= deadline) atAll = { ok: false, reason: '查询失败' }
         if (atAll.ok) {
@@ -841,8 +862,10 @@ export class Relay {
           files: batches[i].files,
         }, webhook, { signal, deadline, sleep: this.sleep })
         if (result.ok) {
-          this.sentIds.add(result.messageId)
-          await this.record(msg, 'discord', bridge.discord, result.messageId, part++)
+          for (const id of [result.messageId, ...(result.extraIds ?? [])]) {
+            this.sentIds.add(id)
+            await this.record(msg, 'discord', bridge.discord, id, part++)
+          }
           continue
         }
         if (result.webhookGone && i === 0) return 'webhookGone'
@@ -916,18 +939,25 @@ export class Relay {
 
   // ---------------------------------------------------------------- 名字缓存
 
+  /** 频道名和所在服务器。查询超时或出错时 60 秒内不再查（F4），每条提到它的消息不用都等一次超时。 */
   private async channel(bot: any, channelId: string): Promise<{ name?: string; guildId?: string }> {
     const cached = this.channelInfo.get(channelId)
     if (cached) return cached
+    const failed = this.channelFailed.get(channelId)
+    if (failed) return failed
     try {
-      const raw = await timed<any, undefined>(bot?.internal?.getChannel(channelId), 10000, undefined)
-      if (raw === undefined) return {}
+      // timed() 超时和出错都返回 undefined
+      const raw = await timed<any, undefined>(bot?.internal?.getChannel(channelId), CHANNEL_TIMEOUT, undefined)
+      if (raw === undefined || raw === null) {
+        this.channelFailed.set(channelId, {})
+        return {}
+      }
       const info = { name: raw?.name, guildId: raw?.guild_id }
       if (info.guildId) this.guildOf.set(channelId, info.guildId)
       this.channelInfo.set(channelId, info)
       return info
     } catch {
-      this.channelInfo.set(channelId, {})
+      this.channelFailed.set(channelId, {})
       return {}
     }
   }
@@ -1012,6 +1042,7 @@ export class Relay {
 
   private async initLastseen(bot: any, channel: string) {
     const id = await this.latestId(bot, channel)
+    if (this.disposed) return
     const current = this.lastseen.get(channel)
     if (current) return
     this.lastseen.set(channel, id)
@@ -1022,6 +1053,7 @@ export class Relay {
   /** 不补发：lastseen 直接设成频道最新的消息（A2）。 */
   private async resetLastseen(bot: any, channel: string) {
     const id = await this.latestId(bot, channel)
+    if (this.disposed) return
     const current = this.lastseen.get(channel)
     // 期间实时消息推得更高（且不是上次运行留下的）就用那个
     if (current && !this.prevRun.has(channel) && compareSnowflake(current, id) > 0) this.lastseen.set(channel, current)

@@ -208,7 +208,7 @@ describe('转发：B10、B11、B12', () => {
     expect(sent).not.toContain('Lantern')
     expect(sent).toContain('Bring shield ships')
     const out = env.qq.text(QQ_GROUP)[0]
-    expect(out).toContain('Vexo Tarrin\n\nFLEET NAME\n\nGrey Lantern\nRoam\n\nSHIPS\n\nBRING SHIELD SHIPS')
+    expect(out).toContain('FLEET COMMANDER：Vexo Tarrin\nFLEET NAME：Grey Lantern\n  Roam\nSHIPS：BRING SHIELD SHIPS')
   })
 
   it('B11：零宽字符不进 QQ，也不进翻译输入', async () => {

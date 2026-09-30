@@ -605,7 +605,7 @@ describe('B7 失败处理和分段', () => {
     expect(posts[1].json.content).toMatch(/^两张\n\\?\[图片\\?\]\n\\?\[图片\\?\]$/)
   })
 
-  it('413 重发时加上占位文字后 content 仍不超过 2000', async () => {
+  it('413 重发时 content 不超过 2000，正文不截断，占位文字放不下就另发一条（F6）', async () => {
     media = await startMedia({ '/small.png': { size: 500 }, '/big.png': { size: 5000 } })
     env = await setup()
     env.discord.fault('POST', /^\/webhooks\//, { status: 413, body: { message: 'Request entity too large', code: 40005 } })
@@ -616,11 +616,12 @@ describe('B7 失败处理和分段', () => {
     ]))
     await env.idle()
     const posts = env.discord.posts()
-    expect(posts).toHaveLength(2)
+    expect(posts).toHaveLength(3)
     expect(posts[0].json.content.length).toBeLessThanOrEqual(2000)
     expect(posts[1].files).toHaveLength(0)
-    expect(posts[1].json.content.length).toBeLessThanOrEqual(2000)
-    expect(posts[1].json.content).toContain('[图片')
+    expect(posts[1].json.content).toBe('a'.repeat(2000))
+    expect(posts[2].json.content.length).toBeLessThanOrEqual(2000)
+    expect(posts[2].json.content).toContain('[图片')
   })
 
   it('10015 Unknown Webhook → 重新创建 webhook 再发', async () => {

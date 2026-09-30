@@ -20,7 +20,7 @@ export function skipReason(stripped: string, direction: 'en2zh' | 'zh2en'): stri
 /**
  * 原文是不是 Koishi 命令（B9，两条都满足才算）：
  * 1. 第一个空白分隔的词（有配置前缀时去掉一个，'/' 只有配置了才去掉）能被 resolve 找到，且不在 notCommands 里（不区分大小写）；
- *    调用方传 ctx.$commander.resolve，不带 session，禁用的别名也算。
+ *    调用方传 ctx.$commander.resolve，不带 session，禁用的别名也算；只有分组、没有 action 的命令调用方返回空（T3，见 isRealCommand）。
  * 2. 整条消息按空白分最多 3 段（中文没有空格时就是一段）。
  */
 export function isCommand(text: string, prefixes: string[], resolve: (word: string) => unknown, notCommands: string[] = []): boolean {
@@ -35,6 +35,17 @@ export function isCommand(text: string, prefixes: string[], resolve: (word: stri
   } catch {
     return false
   }
+}
+
+/**
+ * resolve 找到的是不是有实际功能的命令（T3）：注册 `bridge.status` 时 Koishi 自动生成的父命令 `bridge`
+ * 只是分组、自己没有 action，不算命令（`bridge is up`、`bridge in 5` 照常翻译）。
+ * 拿不到 Koishi 的内部字段时，找到就算。
+ */
+export function isRealCommand(cmd: unknown): boolean {
+  if (!cmd) return false
+  const actions = (cmd as { _actions?: unknown })._actions
+  return Array.isArray(actions) ? actions.length > 0 : true
 }
 
 /** 第一个空白分隔的词；以配置的前缀开头时去掉一个（最长的优先）。 */

@@ -58,7 +58,7 @@ describe('Discord translatable / protect', () => {
     expect(m.protect).toEqual(['@飞行员', '@舰队指挥', '#集合频道', '[fire]', '21:30', '/fleet join'])
   })
 
-  it('embed：标题、描述、字段名和值进入；作者、页脚、链接不进', () => {
+  it('embed：标题、描述、字段（一行「名：值」，和转发的排版一样）进入；作者、页脚、链接不进', () => {
     const m = render({
       content: 'hello',
       embeds: [{
@@ -72,7 +72,7 @@ describe('Discord translatable / protect', () => {
         timestamp: '2026-09-25T13:30:00.000Z',
       }, { type: 'link', title: 'Preview title' }],
     })
-    expect(m.translatable).toBe('hello\n\nTitle #集合频道\n\nDesc line\n\nWhere\n\nLine1\nLine2')
+    expect(m.translatable).toBe('hello\n\nTitle #集合频道\n\nDesc line\n\nWhere：Line1\n  Line2')
     expect(m.translatable).not.toContain('Bot Author')
     expect(m.translatable).not.toContain('Footer text')
     expect(m.translatable).not.toContain('Preview title')

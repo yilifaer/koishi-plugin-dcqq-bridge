@@ -181,8 +181,14 @@ function imageMedia(urls: string[], name = '', extra: Partial<Media> = {}): Medi
   return { kind: 'image', urls, name, placeholder: '[图片]', ...extra }
 }
 
-/** 一个 embed → 文字块（§7.2）。链接预览返回 null。图片放进 media；标题、描述、字段名和值另外放进 tr（翻译输入），字段值在 tr 里的位置 → 字段名记进 fieldOf。 */
-function renderEmbed(e: RawEmbed, env: ContentEnv, media: Media[], tr: string[], fieldOf: Map<number, string>): string | null {
+/** tr 里的字段值 → 字段名、所属 embed（组号）。 */
+interface FieldRef {
+  name: string
+  group: number
+}
+
+/** 一个 embed → 文字块（§7.2）。链接预览返回 null。图片放进 media；标题、描述、字段值另外放进 tr（翻译输入），字段值在 tr 里的位置 → 字段名记进 fieldOf。 */
+function renderEmbed(e: RawEmbed, env: ContentEnv, media: Media[], tr: string[], fieldOf: Map<number, FieldRef>): string | null {
   if (e.type && e.type !== 'rich') return null
   const lines: string[] = []
   if (e.author?.name) lines.push(e.author.name)
@@ -191,11 +197,13 @@ function renderEmbed(e: RawEmbed, env: ContentEnv, media: Media[], tr: string[],
   const desc = e.description ? renderContent(e.description, env) : ''
   if (e.description) lines.push(desc)
   tr.push(title, desc)
+  // 同一个 embed 的字段属于一组：翻译输入里一组字段之间只换一行
+  const group = tr.length
   for (const f of e.fields ?? []) {
     const name = renderContent(f.name ?? '', env)
     const raw = renderContent(f.value ?? '', env)
-    tr.push(name)
-    fieldOf.set(tr.length, name)
+    // 翻译输入里字段名不单独成段：和字段值拼成一行「名：值」（T1），拼接时处理
+    fieldOf.set(tr.length, { name, group })
     tr.push(raw)
     // 字段值有换行：换行后缩进两个空格
     const value = raw.replace(/\n/g, '\n  ')
@@ -343,7 +351,7 @@ export function collectRefs(d: RawMessage): { roles: string[]; channels: string[
 }
 
 /** 渲染一条消息的 embed 和组件，返回文字块。 */
-function renderRich(m: RawSnapshotMessage, env: ContentEnv, media: Media[], hasOther: boolean, tr: string[], fieldOf: Map<number, string>): string[] {
+function renderRich(m: RawSnapshotMessage, env: ContentEnv, media: Media[], hasOther: boolean, tr: string[], fieldOf: Map<number, FieldRef>): string[] {
   const blocks: string[] = []
   for (const e of m.embeds ?? []) {
     const b = renderEmbed(e, env, media, tr, fieldOf)
@@ -366,7 +374,7 @@ export function renderDiscordMessage(d: RawMessage, opts: RenderOptions): Msg | 
   if (!FORWARDED_TYPES.has(d.type ?? 0)) return null
   // 翻译输入的片段、渲染出的受保护记号（回复不收集）
   const tr: string[] = []
-  const fieldOf = new Map<number, string>()
+  const fieldOf = new Map<number, FieldRef>()
   const tokens: string[] = []
   const onToken = (s: string) => { tokens.push(s) }
   const env = envFor(d.mentions, opts, true, onToken)
@@ -431,16 +439,28 @@ export function renderDiscordMessage(d: RawMessage, opts: RenderOptions): Msg | 
     }
   }
 
-  // 翻译输入：各段去掉零宽字符后用空行连起来；记下每个 embed 字段值的位置（B10）
+  // 翻译输入：各段去掉零宽字符后用空行连起来；embed 字段和转发的排版一样，一个字段一行「名：值」，
+  // 同一个 embed 的字段之间只换一行（T1）。记下每个 embed 字段值的位置（B10）
   let translatable = ''
   const fields: NonNullable<Msg['fields']> = []
+  let lastGroup: number | undefined
   tr.forEach((t, i) => {
-    const part = stripZeroWidth(t).trim()
-    if (!part) return
-    if (translatable) translatable += '\n\n'
-    const name = fieldOf.get(i)
-    if (name !== undefined) fields.push({ name: stripZeroWidth(name), start: translatable.length, end: translatable.length + part.length })
-    translatable += part
+    const ref = fieldOf.get(i)
+    const value = stripZeroWidth(t).trim()
+    const name = ref ? stripZeroWidth(ref.name).trim() : ''
+    if (!value && !name) return
+    if (translatable) translatable += ref && ref.group === lastGroup ? '\n' : '\n\n'
+    lastGroup = ref?.group
+    if (!ref || !value) {
+      translatable += value || name
+      return
+    }
+    // 字段值有换行：和转发的一样，换行后缩进两个空格
+    const head = name ? `${name}：` : ''
+    const part = value.replace(/\n/g, '\n  ')
+    const start = translatable.length + head.length
+    fields.push({ name: stripZeroWidth(ref.name), start, end: start + part.length })
+    translatable += head + part
   })
   // 去重，只留真的出现在翻译输入里的
   const protect = [...new Set(tokens.map(stripZeroWidth))].filter((t) => t !== '' && translatable.includes(t))

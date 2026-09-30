@@ -191,7 +191,7 @@ export const Config: Schema<Config> = Schema.intersect([
       ]).default('en(zh)').loose()
         .description('有名字的星系、星域、星座在英译中时怎么写。代号星系（例如 1DQ1-A）永远不翻。'),
       slangFile: str()
-        .description('黑话表文件路径（YAML，相对 Koishi 实例目录）。格式见插件自带的 `data/eve-slang.example.yaml`。写错时只记错误，照常转发。用 `bridge.reload` 重新读取。'),
+        .description('黑话表文件路径（YAML，相对 Koishi 实例目录）。多个文件用 `;;` 分隔，按顺序加载，后面文件里同一个原文的词条覆盖前面的。格式见插件自带的 `data/eve-slang.example.yaml`。写错时只记错误，照常转发。用 `bridge.reload` 重新读取。'),
       overrides: Schema.array(Schema.object({
         en: str().description('英文'),
         zh: str().description('中文'),

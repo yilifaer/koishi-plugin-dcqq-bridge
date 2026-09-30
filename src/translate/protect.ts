@@ -28,12 +28,42 @@ export function normalizeLabel(label: string): string {
   return label.replace(/[*_]/g, '').replace(/[:：]+\s*$/, '').replace(/\s+/g, ' ').trim().toLowerCase()
 }
 
-// 行首「标签 + 冒号」：前面可以有空白、列表符号 `-`/`•` 和粗体、斜体标记（`**FC Name:** 某人`、`**FC Name**: 某人`）
-const LABEL_LINE = /^[\s*_]*(?:[-•][\s*_]+)?([^:：\n]{1,60}?)[\s*_]*[:：][\s*_]*(.*?)\s*$/d
+// 行首「标签 + 冒号」：前面可以有空白、列表符号 `-`/`•` 和粗体、斜体标记（`**FC Name:** 某人`、`**FC Name**: 某人`）。
+// 标签必须以字母、汉字或数字开头，并且只看每行前 200 个字符（T4：只有空格、`*`、`_` 的长行不会让正则回溯很久）；
+// 冒号后面的值不用正则取，直接截到行尾
+const LABEL_HEAD = /^[\s*_]*(?:[-•][\s*_]+)?([\p{L}\p{N}][^:：\n]{0,59}?)[\s*_]*[:：]/u
+const HEAD_LIMIT = 200
+const HAN_CHAR = /\p{Script=Han}/gu
+
+/** 词数（T2）：每个汉字算一个词，其余部分按空白分开，含字母或数字的一段算一个词。 */
+export function countWords(text: string): number {
+  const han = text.match(HAN_CHAR)?.length ?? 0
+  const rest = text.replace(HAN_CHAR, ' ').split(/\s+/).filter((w) => /[\p{L}\p{N}]/u.test(w)).length
+  return han + rest
+}
+
+/** 值很短（T2）：不超过 5 个词，并且不超过 40 个字符。 */
+function isShortValue(value: string): boolean {
+  return value.length <= 40 && countWords(value) <= 5
+}
+
+/** 一行里「标签：值」的标签和值的位置（相对行首）；不是这种行时返回 null。 */
+function labelLine(line: string): { label: string; start: number; end: number } | null {
+  const m = LABEL_HEAD.exec(line.slice(0, HEAD_LIMIT))
+  if (!m) return null
+  let start = m[0].length
+  while (start < line.length && /[\s*_]/.test(line[start])) start++
+  let end = line.length
+  while (end > start && /\s/.test(line[end - 1])) end--
+  if (end <= start) return null
+  return { label: m[1], start, end }
+}
 
 /**
  * 不翻译的范围（B10）：
- * - 某一行以列表里的标签 + 冒号开头：冒号后面到行尾（去掉行尾空白）；
+ * - 某一行以列表里的标签 + 冒号开头：冒号后面到行尾（去掉行尾空白）。只在像 ping 的消息里生效（T2）：
+ *   同一条消息里至少有 2 行命中列表里的标签，或者这个值很短（不超过 5 个词、40 个字符）；
+ *   否则是普通聊天（例如 `FC: everyone align to the sun`），照常翻译；
  * - embed 字段名在列表里：整个字段值（fields 是字段值在 text 里的位置，由渲染时给出）。
  */
 export function keepValueRanges(text: string, labels: string[], fields: Array<{ name: string; start: number; end: number }> = []): Range[] {
@@ -43,15 +73,16 @@ export function keepValueRanges(text: string, labels: string[], fields: Array<{ 
   for (const f of fields) {
     if (set.has(normalizeLabel(f.name)) && f.end > f.start && text.slice(f.start, f.end).trim()) out.push([f.start, f.end])
   }
+  const hits: Array<{ range: Range; short: boolean }> = []
   let offset = 0
   for (const line of text.split('\n')) {
-    const m = LABEL_LINE.exec(line)
-    if (m && m[2] && set.has(normalizeLabel(m[1]))) {
-      const [s, e] = m.indices![2]
-      out.push([offset + s, offset + e])
+    const m = labelLine(line)
+    if (m && set.has(normalizeLabel(m.label))) {
+      hits.push({ range: [offset + m.start, offset + m.end], short: isShortValue(line.slice(m.start, m.end)) })
     }
     offset += line.length + 1
   }
+  for (const h of hits) if (hits.length >= 2 || h.short) out.push(h.range)
   return out
 }
 
@@ -116,6 +147,52 @@ export function protect(text: string, spans: string[], keep: Range[] = []): { te
 export function restore(text: string, tokens: Array<{ token: string; value: string }>): string {
   const map = new Map(tokens.map((t) => [t.token, t.value]))
   return text.replace(ANY_TOKEN, (m) => map.get(m) ?? m)
+}
+
+// 汉字和中文标点（全角标点、CJK 标点、中文引号、省略号、破折号等）
+const CJK_EDGE = /[\p{Script=Han}\u3000-\u303f\uff00-\uffef“”‘’…—·]/u
+const HAN_EDGE = /\p{Script=Han}/u
+
+/**
+ * 还原术语表的占位符（T7）：换进去的是中文、并且这一侧隔着空格紧挨着汉字或中文标点时，去掉这一侧的空格
+ * （「当心，⟦G0⟧ 在我们的本星系」→「当心，墩子在我们的本星系」）。只去掉空格和制表符，不跨行；
+ * 换进去的是英文、旁边是被保护的内容（还没还原的 ⟦0⟧ 等）或者另一个术语时，空格照旧。
+ */
+export function restoreTerms(text: string, tokens: Array<{ token: string; value: string }>): string {
+  const map = new Map(tokens.map((t) => [t.token, t.value]))
+  let out = ''
+  let last = 0
+  let skipFrom = -1
+  // 上一个换进去的术语在 out 里的结束位置：两个术语之间的空格保留（「集结 裂谷级」）
+  let termEnd = -1
+  for (const m of text.matchAll(ANY_TOKEN)) {
+    const value = map.get(m[0])
+    if (value === undefined) continue
+    let between = text.slice(last, m.index!)
+    if (skipFrom === last) between = between.replace(/^[ \t]+/, '')
+    // 左侧：中文术语前面是「汉字/中文标点 + 空格」
+    if (HAN_EDGE.test(value[0] ?? '')) {
+      const joined = out + between
+      const trimmed = joined.replace(/[ \t]+$/, '')
+      if (trimmed !== joined && trimmed.length !== termEnd && CJK_EDGE.test(trimmed.at(-1) ?? '')) {
+        out = trimmed
+        between = ''
+      }
+    }
+    out += between + value
+    termEnd = out.length
+    last = m.index! + m[0].length
+    skipFrom = -1
+    // 右侧：中文术语后面是「空格 + 汉字/中文标点」
+    if (HAN_EDGE.test(value.at(-1) ?? '')) {
+      let k = last
+      while (text[k] === ' ' || text[k] === '\t') k++
+      if (k > last && CJK_EDGE.test(text[k] ?? '')) skipFrom = last
+    }
+  }
+  let rest = text.slice(last)
+  if (skipFrom === last) rest = rest.replace(/^[ \t]+/, '')
+  return out + rest
 }
 
 /** 每个占位符恰好出现一次，没有多出来的 ⟦…⟧，也没有残缺的 ⟦ 或 ⟧。 */
