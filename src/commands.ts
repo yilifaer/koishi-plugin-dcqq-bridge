@@ -2,15 +2,21 @@
 // 回复一律用元素数组并自己 catch（session.send 出错时会把整条内容写进日志，R10）。
 
 import { h } from 'koishi'
-import type { Command, Context, Session } from 'koishi'
+import type { Argv, Command, Context, Session } from 'koishi'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import type { Bridge } from './bridges'
+import {
+  consoleConflict, describeFix, FIX_USAGE, fixesToYaml, fixKey, fixToEntry, loadFixRows, originalOfForwarded, parseFixText,
+} from './fixes'
+import type { FixCommand } from './fixes'
+import { loadCommonWords, sourceTraits, userTermProblem } from './glossary'
 import { bridgesToYaml, convertOldConfig, findOldConfigs, formatReport } from './import'
 import { describeError } from './log'
 import { qqOnline } from './qq/api'
 import type { Relay } from './relay'
 import { splitText } from './text/split'
+import type { Msg } from './types'
 import { utcOffset } from './util'
 
 const DIRECTION_TEXT = { both: '双向', d2q: 'Discord→QQ', q2d: 'QQ→Discord' }
@@ -21,8 +27,8 @@ export function timeFormatter(timeZone: string) {
   return (ms: number) => (ms ? `${format.format(new Date(ms))} (${utcOffset(ms, timeZone)})` : '无')
 }
 
-async function reply(session: Session, text: string) {
-  const pieces = splitText(text, 1500).slice(0, 5)
+async function reply(session: Session, text: string, maxPieces = 5) {
+  const pieces = splitText(text, 1500).slice(0, maxPieces)
   for (const piece of pieces) {
     try {
       if (session.isDirect) await session.bot.sendPrivateMessage(session.userId!, [h.text(piece)])
@@ -252,4 +258,140 @@ export function registerCommands(ctx: Context, relay: Relay) {
       }
       await reply(session, text)
     })
+
+  registerFix(ctx, relay, command)
+}
+
+// ------------------------------------------------------------------ 纠错（B14）
+
+// `纠错 …` / `bridge.fix …` / `bridge fix …`，后面的整段文字交给 parseFixText
+const FIX_COMMAND = /^\s*(?:纠错|bridge(?:\.|\s+)fix)(?:\s+([\s\S]*))?$/i
+
+function registerFix(ctx: Context, relay: Relay, command: Context['command']) {
+  const authority = relay.settings.authority
+
+  // 纠错的参数自己解析：Koishi 会把 `-h` 当成 help 插件的「显示帮助」选项，按空格拆开参数，
+  // 还会把被回复的消息接在参数后面。这里在 Koishi 解析之前直接认出这条命令（权限检查照常）
+  ctx.before('parse', ((content: string, session: Session): Argv | undefined => {
+    const { isDirect, stripped: { prefix, appel } } = session
+    if (!isDirect && typeof prefix !== 'string' && !appel) return
+    const m = FIX_COMMAND.exec(content)
+    if (!m) return
+    return { name: 'bridge.fix', args: [h('', h.parse(m[1] ?? '')).toString(true)], options: {} }
+  }) as (content: string, session: Session) => Argv)
+
+  command('bridge.fix [text:text]', '纠正译法：加、改、删术语词条，马上生效', { authority, captureQuote: false })
+    .alias('纠错')
+    .action(async ({ session, options }, text) => {
+      if (!session) return
+      // 万一没经过上面的解析（例如别的插件调用）：-h、-k 被 Koishi 当成了选项
+      const opts = (options ?? {}) as Record<string, unknown>
+      const flag = opts.k ? '-k ' : opts.h || opts.help ? '-h ' : ''
+      const parsed = parseFixText(flag + (text ?? ''))
+      try {
+        await runFix(ctx, relay, session, parsed)
+      } catch (e) {
+        await reply(session, `纠错失败：${describeError(e)}`)
+      }
+    })
+}
+
+async function runFix(ctx: Context, relay: Relay, session: Session, cmd: FixCommand) {
+  const db = ctx.database
+  const overrides = relay.settings.glossary.overrides
+  switch (cmd.kind) {
+    case 'usage':
+      return reply(session, [cmd.reason, FIX_USAGE].filter(Boolean).join('\n'))
+    case 'list': {
+      const keyword = cmd.keyword.toLowerCase()
+      const rows = (await loadFixRows(ctx)).filter((r) => !keyword || r.src.toLowerCase().includes(keyword) || r.dst.toLowerCase().includes(keyword))
+      if (!rows.length) return reply(session, keyword ? `没有包含「${cmd.keyword}」的纠错词条。` : '还没有纠错词条。')
+      const lines = rows.map((r, i) => {
+        const conflict = consoleConflict(r, overrides)
+        return `${i + 1}. ${describeFix(r)}${conflict ? '　⚠ 控制台的术语覆盖里也有，以控制台为准' : ''}`
+      })
+      const head = keyword ? `包含「${cmd.keyword}」的纠错词条 ${rows.length} 条：` : `纠错词条 ${rows.length} 条：`
+      return reply(session, [head, ...lines].join('\n'), 20)
+    }
+    case 'delete': {
+      const keys = [fixKey(cmd.src, 'en2zh'), fixKey(cmd.src, 'zh2en')]
+      const rows = await db.get('dcqqbridge_glossary', { key: keys })
+      if (!rows.length) return reply(session, `没有找到纠错词条「${cmd.src}」（发「纠错 列表」查看全部）。`)
+      await db.remove('dcqqbridge_glossary', { key: rows.map((r) => r.key) })
+      const lines = rows.map((r) => `已删除：${describeFix(r)}`)
+      const failed = await reloadGlossary(relay)
+      return reply(session, [...lines, failed].filter(Boolean).join('\n'))
+    }
+    case 'export': {
+      const rows = await loadFixRows(ctx)
+      if (!rows.length) return reply(session, '还没有纠错词条，不用导出。')
+      const stamp = new Date(relay.now()).toISOString().replace(/[:.]/g, '-')
+      const dir = resolve(ctx.baseDir, 'data/dcqq-bridge')
+      await mkdir(dir, { recursive: true })
+      const file = resolve(dir, `fixes-${stamp}.yaml`)
+      await writeFile(file, fixesToYaml(rows, stamp), 'utf8')
+      return reply(session, `已导出 ${rows.length} 条到：${file}\n格式和黑话表相同，可以复制进黑话表。`)
+    }
+    case 'add':
+      return addFix(ctx, relay, session, cmd)
+  }
+}
+
+async function addFix(ctx: Context, relay: Relay, session: Session, cmd: Extract<FixCommand, { kind: 'add' }>) {
+  const db = ctx.database
+  // 和黑话表、控制台 overrides 走同一套检查
+  const problem = userTermProblem(fixToEntry(cmd))
+  if (problem) {
+    return reply(session, problem.includes('少于') ? `没有添加：原文和译法都至少要 2 个字。` : `没有添加：${problem}。`)
+  }
+  const key = fixKey(cmd.src, cmd.dir)
+  const [old] = await db.get('dcqqbridge_glossary', { key })
+  const row = {
+    key, src: cmd.src, dst: cmd.dst, mode: cmd.mode, dir: cmd.dir,
+    createdBy: `${session.platform}:${session.userId}`, createdAt: new Date(relay.now()),
+  }
+  await db.upsert('dcqqbridge_glossary', [row])
+  const lines = [`${old ? '已修改' : '已添加'}：${describeFix(row)}`]
+  if (old) lines.push(`原来是：${describeFix(old)}`)
+  const traits = sourceTraits(cmd.src, loadCommonWords())
+  if (cmd.dir === 'en2zh' && cmd.mode === 'force' && traits.common) {
+    lines.push(`⚠ ${cmd.src} 是常用词，强制替换可能误伤普通句子，确定吗？加 -h 改成参考`)
+  }
+  if (/[A-Za-z]/.test(cmd.src) && traits.exact) lines.push('提示：3 个字母以内的英文只匹配大小写完全一致的写法。')
+  const conflict = consoleConflict(row, relay.settings.glossary.overrides)
+  if (conflict) lines.push(`⚠ 控制台的术语覆盖里也有「${cmd.src}」（${conflict.en} / ${conflict.zh}），以控制台为准，这条暂时不起作用。`)
+  const failed = await reloadGlossary(relay)
+  if (failed) lines.push(failed)
+  await reply(session, lines.join('\n'))
+  // 回复一条转发过来的消息来纠错：用新词条把它重新翻译一次，只回复在这里（不转发）
+  if (session.quote?.id) await retranslate(relay, session)
+}
+
+/** 重新生成术语表（版本号变了，翻译缓存随之失效）。失败时返回给用户看的一句话。 */
+async function reloadGlossary(relay: Relay): Promise<string | undefined> {
+  try {
+    await relay.translation.reload()
+  } catch (e) {
+    return `词条已保存，但重新读取术语表失败：${describeError(e)}`
+  }
+}
+
+async function retranslate(relay: Relay, session: Session) {
+  try {
+    const quote = session.quote!
+    const rows = await relay.store.byTarget(session.channelId!, quote.id!)
+    if (!rows.length) return void await reply(session, '被回复的不是转发过来的消息，没有重新翻译。')
+    const settings = relay.settings
+    if (!settings.translate.enabled) return void await reply(session, '翻译没有打开，没有重新翻译。')
+    const elements = quote.elements ?? h.parse(quote.content ?? '')
+    const original = originalOfForwarded(h('', elements).toString(true), { label: settings.translate.label, fallbackText: settings.atAll.fallbackText })
+    if (!original) return void await reply(session, '被回复的消息里没有文字，没有重新翻译。')
+    // 从 Discord 转来的是英文，从 QQ 转来的是中文
+    const direction = rows[0].srcPlatform === 'discord' ? 'en2zh' : 'zh2en'
+    const outcome = await relay.translation.translate({ translatable: original } as Msg, direction)
+    if (outcome.ok) await reply(session, `用新词条重新翻译：\n${settings.translate.label} ${outcome.text}`)
+    else await reply(session, `重新翻译没有结果：${outcome.reason}（词条已经加上了）`)
+  } catch (e) {
+    await reply(session, `重新翻译失败：${describeError(e)}（词条已经加上了）`)
+  }
 }

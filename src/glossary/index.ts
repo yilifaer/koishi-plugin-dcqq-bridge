@@ -4,5 +4,5 @@ export type {
   GlossaryOptions, GlossarySources, GlossaryApplication,
 } from './types'
 export { parseSlangYaml } from './slang'
-export { buildGlossary, Glossary } from './glossary'
+export { buildGlossary, Glossary, sourceTraits, userTermProblem } from './glossary'
 export { loadCommonWords, loadEveData } from './load'

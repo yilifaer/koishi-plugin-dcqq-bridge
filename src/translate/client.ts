@@ -28,7 +28,7 @@ export interface TranslateInput {
   sourceForChecks: string
 }
 
-const RULES = '只翻译 <text> 和 </text> 之间的内容。形如 ⟦0⟧、⟦G0⟧ 的占位符必须原样保留，不能改动、删除或增加。保留原文的换行。只输出译文，不要解释，不要加任何说明或标签。'
+const RULES = '只翻译 <text> 和 </text> 之间的内容。形如 ⟦0⟧、⟦G0⟧ 的占位符必须原样保留，不能改动、删除或增加。玩家和角色名、军团和联盟名及其简称、舰队制式名、语音频道名一律不翻译、不音译，原样保留。保留原文的换行。只输出译文，不要解释，不要加任何说明或标签。'
 const SYSTEM: Record<TranslateInput['direction'], string> = {
   en2zh: `你是翻译引擎，把英文翻译成简体中文。${RULES}`,
   zh2en: `你是翻译引擎，把中文翻译成英文。${RULES}`,

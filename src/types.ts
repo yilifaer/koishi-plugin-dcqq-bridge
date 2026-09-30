@@ -69,6 +69,8 @@ export interface Msg {
   translatable?: string
   /** 翻译时要原样保护的文字：提及、频道、表情渲染后的文字、换算后的时间等（清单 §12.1 第 2 步）。 */
   protect?: string[]
+  /** Discord embed 字段值在 translatable 里的位置（B10：字段名在 keepValueLabels 里时整段不翻译）。 */
+  fields?: Array<{ name: string; start: number; end: number }>
 }
 
 /** 正文和文字块拼起来的完整文字（不含前缀、回复引用行）。 */
