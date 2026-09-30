@@ -37,6 +37,8 @@ export interface GlossaryOptions {
 export interface GlossarySources {
   eveData?: EveData | null
   slang?: SlangEntry[] | null
+  /** 每条黑话给警告用的位置（多个黑话表文件时带文件名，T8）；不填时写「黑话表第 N 条」 */
+  slangWhere?: string[]
   /** 纠错命令加的词条（B14），优先级和 overrides 相同，排在 overrides 后面（同一个原文以控制台为准） */
   fixes?: SlangEntry[] | null
   commonWords: Set<string>

@@ -1,6 +1,7 @@
 // 纠错命令（B14）：在群里或频道里直接加、改、删术语词条，存在 dcqqbridge_glossary 表里，不写 koishi.yml。
 // 这里只放解析、判断方向、读写数据表、导出这些不依赖会话的部分；命令本身在 commands.ts 里注册。
 
+import { h } from 'koishi'
 import type { Context } from 'koishi'
 import yaml from 'js-yaml'
 import type { GlossaryMode, SlangEntry } from './glossary'
@@ -9,14 +10,16 @@ import { stripOwnDecorations } from './text/reply'
 
 export type FixDir = 'en2zh' | 'zh2en'
 
+// 用法里不用尖括号：所有者照抄过 `纠错 <原文> = <译法>`，把尖括号也打了进去（T6）
 export const FIX_USAGE = [
   '用法：',
-  '纠错 <原文> = <译法>　　强制替换（例如：纠错 standing fleet = 值守舰队）',
-  '纠错 -h <原文> = <译法>　只作参考，交给模型决定',
-  '纠错 -k <原文>　　　　　原样保留，不翻译',
-  '纠错 列表 [关键词]',
-  '纠错 删除 <原文>',
+  '纠错 原文 = 译法　　　强制替换',
+  '纠错 -h 原文 = 译法　只作参考，交给模型决定',
+  '纠错 -k 原文　　　　　原样保留，不翻译',
+  '纠错 列表　　　　　　列出全部（后面加关键词只列包含它的）',
+  '纠错 删除 原文',
   '纠错 导出',
+  '例如：纠错 standing fleet = 值守舰队',
   '方向自动判断：原文是英文、译法是中文 → 英译中；反过来 → 中译英。',
 ].join('\n')
 
@@ -53,6 +56,49 @@ export function keepDirection(src: string): FixDir | null {
   return null
 }
 
+// 用户多打的一对括号（T6）：半角、全角尖括号和书名号
+const WRAPPERS: Array<[string, string]> = [['<', '>'], ['＜', '＞'], ['〈', '〉'], ['《', '》']]
+
+/** 原文、译法被一对 `<…>`、`〈…〉`、`《…》` 整个包住时去掉（里面没有别的括号才算整个包住）。 */
+export function stripWrapper(text: string): string {
+  const t = text.trim()
+  for (const [open, close] of WRAPPERS) {
+    if (t.length > 2 && t.startsWith(open) && t.endsWith(close)) {
+      const inner = t.slice(open.length, -close.length)
+      if (!inner.includes(open) && !inner.includes(close) && inner.trim()) return inner.trim()
+    }
+  }
+  return t
+}
+
+// Satori 的标准消息元素：这些照常去掉标签只留文字；别的「元素」其实是用户打的尖括号（例如 `<afk cloaker>`）
+const KNOWN_ELEMENTS = new Set([
+  'at', 'sharp', 'a', 'img', 'image', 'audio', 'video', 'file', 'face', 'emoji', 'quote', 'author', 'br', 'p', 'message',
+  'b', 'strong', 'i', 'em', 'u', 'ins', 's', 'del', 'spl', 'code', 'sup', 'sub', 'button', 'figure', 'record', 'mface',
+])
+// 排版元素：没有内容时不可能是平台发来的，按用户打的尖括号处理
+const FORMAT_ELEMENTS = new Set(['a', 'p', 'b', 'strong', 'i', 'em', 'u', 'ins', 's', 'del', 'spl', 'code', 'sup', 'sub'])
+
+/**
+ * 纠错命令收到的内容（消息元素的写法）→ 纯文字。沙盒这类平台不转义用户打的 `<`，
+ * `纠错 删除 <afk cloaker>` 到这里就成了一个叫 afk 的元素，直接去标签会变成空内容（T6）；
+ * 所以不认识的元素（或者带着没有值的属性）按原样写回尖括号，交给 parseFixText 去掉。
+ */
+export function fixArgText(content: string): string {
+  const render = (el: h): string => {
+    if (el.type === 'text') return String(el.attrs.content ?? '')
+    const attrs = Object.entries(el.attrs)
+    const literal = !KNOWN_ELEMENTS.has(el.type)
+      || attrs.some(([, v]) => v === true)
+      || (FORMAT_ELEMENTS.has(el.type) && !el.children.length)
+    if (!literal) return h('', [el]).toString(true)
+    const kebab = (k: string) => k.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)
+    const attrText = attrs.map(([k, v]) => (v === true ? ` ${kebab(k)}` : ` ${kebab(k)}="${String(v)}"`)).join('')
+    return `<${el.type}${attrText}>${el.children.map(render).join('')}`
+  }
+  return h.parse(content).map(render).join('')
+}
+
 /** 解析 `纠错` 后面的整段文字（Koishi 按空格拆参数，这里自己拆：原文、译法里可以有空格）。 */
 export function parseFixText(input: string): FixCommand {
   let text = input.replace(/\s+/g, ' ').trim()
@@ -63,7 +109,10 @@ export function parseFixText(input: string): FixCommand {
     const [word, ...rest] = text.split(' ')
     const arg = rest.join(' ').trim()
     if (/^(?:列表|list)$/i.test(word)) return { kind: 'list', keyword: arg }
-    if (/^(?:删除|delete|del)$/i.test(word)) return arg ? { kind: 'delete', src: arg } : { kind: 'usage', reason: '请写要删除的原文。' }
+    if (/^(?:删除|delete|del)$/i.test(word)) {
+      const src = stripWrapper(arg)
+      return src ? { kind: 'delete', src } : { kind: 'usage', reason: '请写要删除的原文。' }
+    }
     if (/^(?:导出|export)$/i.test(word)) return { kind: 'export' }
   }
   let mode: GlossaryMode = 'force'
@@ -72,6 +121,7 @@ export function parseFixText(input: string): FixCommand {
     mode = flag[1].toLowerCase() === 'h' ? 'hint' : 'keep'
     text = text.slice(flag[0].length).trim()
   }
+  if (mode === 'keep') text = stripWrapper(text)
   if (mode === 'keep') {
     if (hasEq) return { kind: 'usage', reason: '-k 是原样保留，不用写译法。' }
     if (!text) return { kind: 'usage', reason: '请写要原样保留的原文。' }
@@ -82,8 +132,8 @@ export function parseFixText(input: string): FixCommand {
   }
   const eq = text.search(/[=＝]/)
   if (eq < 0) return { kind: 'usage', reason: '缺少「=」。' }
-  const src = text.slice(0, eq).trim()
-  const dst = text.slice(eq + 1).trim()
+  const src = stripWrapper(text.slice(0, eq))
+  const dst = stripWrapper(text.slice(eq + 1))
   if (!src || !dst) return { kind: 'usage', reason: '「=」两边都要写。' }
   if (/[=＝]/.test(dst)) return { kind: 'usage', reason: '只能有一个「=」。' }
   if (src.length > MAX_LENGTH || dst.length > MAX_LENGTH) return { kind: 'usage', reason: `原文或译法太长（最多 ${MAX_LENGTH} 个字）。` }

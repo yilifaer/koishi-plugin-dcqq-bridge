@@ -224,10 +224,12 @@ export function normalizeSettings(config: Partial<Config>): Settings {
 
   const rows: BridgeRow[] = Array.isArray(config.bridges) ? config.bridges : []
   const seen = new Map<string, RowStatus>()
+  /** 整行校验失败的行号。 */
+  const broken = new Set<number>()
   rows.forEach((raw: any, i) => {
     // 整行校验失败时 schema 返回的是光秃秃的哨兵（没有补默认值）；空行（null）会补上默认值，按普通空行处理
-    const broken = !raw || typeof raw !== 'object' || Array.isArray(raw) || (raw[INVALID_ROW_KEY] === true && !('direction' in raw))
-    const row = broken ? {} : raw
+    const isBroken = !raw || typeof raw !== 'object' || Array.isArray(raw) || (raw[INVALID_ROW_KEY] === true && !('direction' in raw))
+    const row = isBroken ? {} : raw
     const status: RowStatus = {
       index: i + 1,
       label: text(row.label).trim(),
@@ -240,7 +242,8 @@ export function normalizeSettings(config: Partial<Config>): Settings {
       bridge: null,
     }
     settings.rows.push(status)
-    if (broken) {
+    if (isBroken) {
+      broken.add(status.index)
       status.invalid = `第 ${i + 1} 行有写错的字段（例如方向、启用写成了别的值），已跳过`
       return
     }
@@ -281,6 +284,14 @@ export function normalizeSettings(config: Partial<Config>): Settings {
     }
     settings.bridges.push(status.bridge)
   })
+  // 无效的行也放进全局问题（F5）：写错的行连桥名和 ID 都没了，在群里按群筛选、私聊不加 -a 时都看不到这一行
+  for (const status of settings.rows) {
+    if (!status.invalid) continue
+    const hint = `（到控制台表格里检查第 ${status.index} 行）`
+    problems.push(broken.has(status.index)
+      ? `第 ${status.index} 行桥有写错的字段，已跳过${hint}`
+      : `第 ${status.index} 行桥无效，已跳过：${status.invalid}${hint}`)
+  }
   return settings
 }
 

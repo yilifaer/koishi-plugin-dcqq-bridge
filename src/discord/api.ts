@@ -4,7 +4,6 @@
 import type { FileData } from '../types'
 import { describeError, internalErrorInfo } from '../log'
 import { escapeDiscord } from '../out/discord'
-import { cutUnits } from '../text/split'
 
 export interface Webhook {
   id: string
@@ -23,7 +22,8 @@ export interface DiscordPayload {
 }
 
 export type SendResult =
-  | { ok: true; messageId: string }
+  /** extraIds：413 后占位文字另发的那一条（F6）。 */
+  | { ok: true; messageId: string; extraIds?: string[] }
   | { ok: false; reason: string; maybeSent: boolean; webhookGone?: boolean }
 
 export interface SendOptions {
@@ -113,14 +113,24 @@ function buildBody(payload: DiscordPayload, mode: 'webhook' | 'bot') {
   return { body: form, multipart: true }
 }
 
-/** 这一批的文件全部换成占位文字（413 时用；这样一定能发出去）。 */
-function dropAll(payload: DiscordPayload): DiscordPayload {
-  if (!payload.files.length) return payload
-  const placeholders = cutUnits(payload.files.map((file) => escapeDiscord(file.placeholder)).join('\n'), 2000)
-  // 加上占位文字后仍不能超过 2000 字，放不下时截掉正文末尾
-  const room = 2000 - placeholders.length - 1
-  const content = payload.content && room > 0 ? `${cutUnits(payload.content, room)}\n${placeholders}` : placeholders
-  return { ...payload, content, files: [] }
+const CONTENT_LIMIT = 2000
+
+/**
+ * 这一批的文件全部换成占位文字（413 时用；这样一定能发出去）。
+ * 用户的原文一个字都不截（F6）：占位文字跟在后面放不下时，合成一句「[另有 N 个文件过大未发送]」；
+ * 还放不下，就把占位文字放进 extra，另发一条。
+ */
+export function dropAll(payload: DiscordPayload): { payload: DiscordPayload; extra?: string } {
+  if (!payload.files.length) return { payload }
+  const joined = payload.files.map((file) => escapeDiscord(file.placeholder)).join('\n')
+  const merged = escapeDiscord(`[另有 ${payload.files.length} 个文件过大未发送]`)
+  const alone = joined.length <= CONTENT_LIMIT ? joined : merged
+  const content = payload.content
+  const fits = (tail: string) => content.length + 1 + tail.length <= CONTENT_LIMIT
+  if (!content) return { payload: { ...payload, content: alone, files: [] } }
+  if (fits(joined)) return { payload: { ...payload, content: `${content}\n${joined}`, files: [] } }
+  if (fits(merged)) return { payload: { ...payload, content: `${content}\n${merged}`, files: [] } }
+  return { payload: { ...payload, files: [] }, extra: alone }
 }
 
 export class DiscordSender {
@@ -189,6 +199,8 @@ export class DiscordSender {
     let webhookRetried = false
     let wh = webhook
     let current = payload
+    /** 413 后放不进正文、要另发一条的占位文字。 */
+    let extra: string | undefined
     while (true) {
       const remaining = options.deadline - now()
       if (remaining <= 0 || options.signal.aborted) return { ok: false, reason: '超过 60 秒，放弃', maybeSent: false }
@@ -215,7 +227,11 @@ export class DiscordSender {
         })
         const id = response?.data?.id
         if (!id) return { ok: false, reason: 'Discord 没有返回消息 ID', maybeSent: true }
-        return { ok: true, messageId: String(id) }
+        if (!extra) return { ok: true, messageId: String(id) }
+        // 正文已经发出：占位文字另发一条（失败只写日志，不影响这条的结果）
+        const rest = await this.send(bot, channelId, { content: extra, username: current.username, avatarUrl: current.avatarUrl, files: [] }, wh, options)
+        if (!rest.ok) this.logger.warn(`发往 Discord 频道 ${channelId} 的「文件过大未发送」提示没有发出：${rest.reason}`)
+        return { ok: true, messageId: String(id), ...(rest.ok ? { extraIds: [rest.messageId] } : {}) }
       } catch (error) {
         const failure = classify(bot.http, error)
         const reason = describeError(error)
@@ -235,7 +251,7 @@ export class DiscordSender {
           case 'tooLarge':
             if (largeRetried || !current.files.length) return { ok: false, reason, maybeSent: false }
             largeRetried = true
-            current = dropAll(current)
+            ;({ payload: current, extra } = dropAll(current))
             continue
           case 'username':
             if (usernameRetried || !wh) return { ok: false, reason, maybeSent: false }

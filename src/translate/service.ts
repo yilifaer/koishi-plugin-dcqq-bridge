@@ -7,12 +7,13 @@ import { resolve } from 'node:path'
 import type { Context } from 'koishi'
 import type { Settings } from '../bridges'
 import { KeywordFilter, Moderator, parseKeywordLines, resolveModerationKey } from '../filter'
-import { buildGlossary, Glossary, loadCommonWords, loadEveData, parseSlangYaml } from '../glossary'
+import { buildGlossary, Glossary, loadCommonWords, loadEveData, mergeSlangFiles, parseSlangYaml, splitSlangPaths } from '../glossary'
+import type { SlangFileResult, SlangFileSummary } from '../glossary'
 import { fixToEntry, loadFixRows } from '../fixes'
 import type { Msg } from '../types'
 import { Translator } from './client'
-import { keepValueRanges, protect, restore, stripTokens } from './protect'
-import { isCommand, rootPrefixes, skipReason } from './skip'
+import { keepValueRanges, protect, restore, restoreTerms, stripTokens } from './protect'
+import { isCommand, isRealCommand, rootPrefixes, skipReason } from './skip'
 
 export type TranslateDirection = 'en2zh' | 'zh2en'
 
@@ -34,6 +35,8 @@ export class TranslationService {
   keywords: KeywordFilter | null = null
   /** 读取关键词、术语表时的问题（给 bridge.status 显示）。 */
   problems: string[] = []
+  /** 各个黑话表文件读到的条数（给 bridge.reload 的回复用，T8） */
+  slangFiles: SlangFileSummary[] = []
   /** 各种原因的计数（跳过和失败都算）。 */
   outcomes = new Map<string, number>()
   translator: Translator
@@ -97,16 +100,24 @@ export class TranslationService {
     }
     if (this.moderationKeyMissing()) problems.push('审核未配置密钥，译文全部不附')
     // 术语表
-    let slang = null
-    if (s.glossary.slangFile) {
+    // 黑话表可以有多个文件（`;;` 分隔，T8）：每个文件单独读、单独报错，后面文件的同一个原文覆盖前面的
+    const paths = splitSlangPaths(s.glossary.slangFile)
+    const files: SlangFileResult[] = []
+    for (const file of paths) {
+      const where = paths.length > 1 ? `黑话表 ${file}` : '黑话表'
       try {
-        const parsed = parseSlangYaml(await readFile(this.path(s.glossary.slangFile), 'utf8'))
-        slang = parsed.entries
-        problems.push(...parsed.warnings.map((w) => `黑话表：${w}`))
+        const parsed = parseSlangYaml(await readFile(this.path(file), 'utf8'))
+        files.push({ path: file, entries: parsed.entries, warnings: parsed.warnings })
+        // 多个文件时，一个文件写错只影响它自己
+        const note = (w: string) => (paths.length > 1 ? w.replace('当作没有黑话表', '这个文件当作空的，其他文件照常加载') : w)
+        problems.push(...parsed.warnings.map((w) => `${where}：${note(w)}`))
       } catch (e: any) {
-        problems.push(`黑话表文件读不到：${s.glossary.slangFile}（${e?.code ?? '读取失败'}）`)
+        files.push({ path: file, entries: null, error: e?.code ?? '读取失败', warnings: [] })
+        problems.push(`黑话表文件读不到：${file}（${e?.code ?? '读取失败'}）`)
       }
     }
+    const mergedSlang = mergeSlangFiles(files)
+    this.slangFiles = mergedSlang.summary
     let eveData = null
     if (s.glossary.eve) {
       eveData = loadEveData()
@@ -122,7 +133,7 @@ export class TranslationService {
     try {
       const built = buildGlossary(
         { eve: s.glossary.eve, systemStyle: s.glossary.systemStyle, overrides: s.glossary.overrides },
-        { eveData, slang, fixes, commonWords: loadCommonWords() },
+        { eveData, slang: mergedSlang.entries, slangWhere: mergedSlang.where, fixes, commonWords: loadCommonWords() },
       )
       this.glossary = built.glossary
       problems.push(...built.warnings.map((w) => `术语表：${w}`))
@@ -163,7 +174,7 @@ export class TranslationService {
     if (!source) return this.skip('没有可翻译的文字')
     if (this.keywords?.matches(source)) return this.skip('关键词命中原文')
     const notCommands = this.getSettings().translate.notCommands
-    if (isCommand(source, this.prefixes(), (word) => this.ctx.$commander.resolve(word), notCommands)) return this.skip('命令')
+    if (isCommand(source, this.prefixes(), (word) => isRealCommand(this.ctx.$commander.resolve(word)), notCommands)) return this.skip('命令')
     // B10：标签后面的值、指定 embed 字段的值整段不翻译（字段位置按 translatable 算，只在没被裁剪时用）
     const fields = source === msg.translatable ? msg.fields : undefined
     const guarded = protect(source, msg.protect ?? [], keepValueRanges(source, this.getSettings().translate.keepValueLabels, fields))
@@ -176,9 +187,9 @@ export class TranslationService {
     if (this.moderationKeyMissing()) return this.skip('审核未配置密钥')
     // B3：去掉所有占位符（保护 + 术语）后没有文字 → 不请求服务商；术语换完后和原文不同就本地生成译文
     if (!HAN_OR_LETTER.test(stripped)) {
-      const local = restore(restore(applied.text, applied.tokens), guarded.tokens).trim()
+      const local = restore(restoreTerms(applied.text, applied.tokens), guarded.tokens).trim()
       if (!local || normalizeForCompare(local) === normalizeForCompare(source)) return this.skip('只有术语')
-      return this.finish(local, stripTokens(restore(applied.text, applied.tokens)), source, null)
+      return this.finish(local, stripTokens(restoreTerms(applied.text, applied.tokens)), source, null)
     }
     // 保留标签改了之后译文也要重新生成，所以一起算进缓存 key
     const labels = this.getSettings().translate.keepValueLabels.join(';;')
@@ -207,9 +218,9 @@ export class TranslationService {
       }
       return this.fail(result.reason)
     }
-    const text = restore(restore(result.text, applied.tokens), guarded.tokens).trim()
+    const text = restore(restoreTerms(result.text, applied.tokens), guarded.tokens).trim()
     // 送审的文字不带被保护的内容（用户名、QQ 号、网址等），只还原术语
-    return this.finish(text, stripTokens(restore(result.text, applied.tokens)), source, key)
+    return this.finish(text, stripTokens(restoreTerms(result.text, applied.tokens)), source, key)
   }
 
   /** 译文的最后几步：和原文比较、关键词、审核、缓存。key 为 null 时不缓存（本地生成的译文）。 */

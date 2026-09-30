@@ -7,7 +7,7 @@ import { mkdir, writeFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import type { Bridge } from './bridges'
 import {
-  consoleConflict, describeFix, FIX_USAGE, fixesToYaml, fixKey, fixToEntry, loadFixRows, originalOfForwarded, parseFixText,
+  consoleConflict, describeFix, fixArgText, FIX_USAGE, fixesToYaml, fixKey, fixToEntry, loadFixRows, originalOfForwarded, parseFixText,
 } from './fixes'
 import type { FixCommand } from './fixes'
 import { loadCommonWords, sourceTraits, userTermProblem } from './glossary'
@@ -225,12 +225,23 @@ export function registerCommands(ctx: Context, relay: Relay) {
         const problems = relay.translation.problems
         await reply(session, [
           `已重新读取。关键词 ${relay.translation.keywords?.size ?? 0} 条，术语 ${glossary?.size ?? 0} 条。`,
+          ...slangLine(relay.translation.slangFiles),
           ...(problems.length ? ['问题：', ...problems.slice(0, 30).map((p) => `⚠ ${p}`)] : []),
         ].join('\n'))
       } catch (e) {
         await reply(session, `重新读取失败：${describeError(e)}`)
       }
     })
+
+  /** 每个黑话表文件的条数（T8），例如「黑话表：glossary.yaml 301 条，local-slang.yaml 2 条」；没配黑话表时不写这一行。 */
+  const slangLine = (files: typeof relay.translation.slangFiles) => {
+    if (!files.length) return []
+    const parts = files.map((f) => {
+      if (f.count === null) return `${f.name} 读不到`
+      return `${f.name} ${f.count} 条${f.replaced ? `（覆盖前面文件里的 ${f.replaced} 条）` : ''}`
+    })
+    return [`黑话表：${parts.join('，')}`]
+  }
 
   command('bridge.import', '从 @myrtus/forward 的配置生成桥（只输出，不改配置）', { authority })
     .action(async ({ session }) => {
@@ -277,7 +288,7 @@ function registerFix(ctx: Context, relay: Relay, command: Context['command']) {
     if (!isDirect && typeof prefix !== 'string' && !appel) return
     const m = FIX_COMMAND.exec(content)
     if (!m) return
-    return { name: 'bridge.fix', args: [h('', h.parse(m[1] ?? '')).toString(true)], options: {} }
+    return { name: 'bridge.fix', args: [fixArgText(m[1] ?? '')], options: {} }
   }) as (content: string, session: Session) => Argv)
 
   command('bridge.fix [text:text]', '纠正译法：加、改、删术语词条，马上生效', { authority, captureQuote: false })
@@ -356,6 +367,10 @@ async function addFix(ctx: Context, relay: Relay, session: Session, cmd: Extract
   const traits = sourceTraits(cmd.src, loadCommonWords())
   if (cmd.dir === 'en2zh' && cmd.mode === 'force' && traits.common) {
     lines.push(`⚠ ${cmd.src} 是常用词，强制替换可能误伤普通句子，确定吗？加 -h 改成参考`)
+  }
+  // T5：常用词原样保留，普通句子里的这个词也不会再翻译（照样加上，只提醒）
+  if (cmd.dir === 'en2zh' && cmd.mode === 'keep' && traits.common) {
+    lines.push(`⚠ ${cmd.src} 是常用词，原样保留后普通句子里的 ${cmd.src} 也不会被翻译`)
   }
   if (/[A-Za-z]/.test(cmd.src) && traits.exact) lines.push('提示：3 个字母以内的英文只匹配大小写完全一致的写法。')
   const conflict = consoleConflict(row, relay.settings.glossary.overrides)

@@ -19,6 +19,8 @@ export interface AtAllRemain {
 }
 
 const ROLE_TTL = 10 * 60 * 1000
+/** 查询最晚到队首时限之前这么久（留给发送）。 */
+const DEADLINE_RESERVE = 10000
 
 export interface AtAllGateOptions {
   /** 单个查询的超时（毫秒），默认 8000。 */
@@ -106,11 +108,16 @@ export class AtAllGate {
     }
   }
 
-  /** 每个查询最多 queryTimeout，整体最多 decideTimeout；超时按「查询失败」，晚到的结果不产生任何效果。 */
-  async decide(bot: any, groupId: string, msg: Msg): Promise<AtAllDecision> {
+  /**
+   * 每个查询最多 queryTimeout，整体最多 decideTimeout；超时按「查询失败」，晚到的结果不产生任何效果。
+   * 给了 deadline（队首时限）时，整体最多到 deadline 前 10 秒，给改发的文字留出发送时间（F3）；已经不够时直接按「查询失败」。
+   */
+  async decide(bot: any, groupId: string, msg: Msg, deadline?: number): Promise<AtAllDecision> {
+    const limit = deadline === undefined ? this.decideTimeout : Math.min(this.decideTimeout, deadline - this.now() - DEADLINE_RESERVE)
+    if (!(limit > 0)) return { ok: false, reason: '查询失败' }
     const state = { expired: false }
     try {
-      return await withTimeout(this.decideInner(bot, groupId, msg, state), this.decideTimeout)
+      return await withTimeout(this.decideInner(bot, groupId, msg, state), limit)
     } catch {
       return { ok: false, reason: '查询失败' }
     } finally {
