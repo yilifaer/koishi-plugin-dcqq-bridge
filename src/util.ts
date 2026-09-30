@@ -109,3 +109,16 @@ export function dateIn(timeZone: string) {
   const format = new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' })
   return (ms: number) => format.format(new Date(ms))
 }
+
+/** 某个时刻在这个时区的 UTC 偏移，例如 `UTC+8`、`UTC+9:30`、`UTC-3:30`；零偏移写 `UTC`（按那个时刻算，夏令时也对）。 */
+export function utcOffset(ms: number, timeZone: string): string {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone, hourCycle: 'h23', year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric',
+  }).formatToParts(new Date(ms))
+  const get = (type: string) => Number(parts.find((p) => p.type === type)?.value)
+  const wall = Date.UTC(get('year'), get('month') - 1, get('day'), get('hour'), get('minute'), get('second'))
+  const minutes = Math.round((wall - Math.floor(ms / 1000) * 1000) / 60000)
+  if (!minutes) return 'UTC'
+  const abs = Math.abs(minutes)
+  return `UTC${minutes > 0 ? '+' : '-'}${Math.floor(abs / 60)}${abs % 60 ? `:${String(abs % 60).padStart(2, '0')}` : ''}`
+}

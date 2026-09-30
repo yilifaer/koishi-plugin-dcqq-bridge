@@ -26,14 +26,7 @@ export function skipReason(stripped: string, direction: 'en2zh' | 'zh2en'): stri
 export function isCommand(text: string, prefixes: string[], resolve: (word: string) => unknown, notCommands: string[] = []): boolean {
   const parts = text.trim().split(/\s+/)
   if (parts.length > 3) return false
-  let word = parts[0] ?? ''
-  const sorted = prefixes.filter((p) => typeof p === 'string' && p).sort((a, b) => b.length - a.length)
-  for (const prefix of sorted) {
-    if (word.startsWith(prefix)) {
-      word = word.slice(prefix.length)
-      break
-    }
-  }
+  const word = commandWord(text, prefixes)
   if (!word) return false
   const lower = word.toLowerCase()
   if (notCommands.some((w) => w.toLowerCase() === lower)) return false
@@ -42,4 +35,24 @@ export function isCommand(text: string, prefixes: string[], resolve: (word: stri
   } catch {
     return false
   }
+}
+
+/** 第一个空白分隔的词；以配置的前缀开头时去掉一个（最长的优先）。 */
+export function commandWord(text: string, prefixes: string[]): string {
+  let word = text.trim().split(/\s+/)[0] ?? ''
+  const sorted = prefixes.filter((p) => typeof p === 'string' && p).sort((a, b) => b.length - a.length)
+  for (const prefix of sorted) {
+    if (word.startsWith(prefix)) {
+      word = word.slice(prefix.length)
+      break
+    }
+  }
+  return word
+}
+
+/** Koishi 全局配置里的命令前缀（空字符串不算）。 */
+export function rootPrefixes(config: any): string[] {
+  const raw = config?.prefix
+  const list = Array.isArray(raw) ? raw : raw === undefined || raw === null ? [] : [raw]
+  return list.filter((p): p is string => typeof p === 'string' && p !== '')
 }

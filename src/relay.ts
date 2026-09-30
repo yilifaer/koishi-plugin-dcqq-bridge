@@ -1,7 +1,7 @@
 // 消息管道（清单 §6、§9、§11、§15、§16）。
 
 import { Context, h, Logger, Universal } from 'koishi'
-import type { Element, Session } from 'koishi'
+import type { Command, Element, Session } from 'koishi'
 import type {} from '@satorijs/adapter-discord'
 import { AtAllGate } from './atall'
 import { Bridge, bridgesFrom, normalizeSettings, Settings } from './bridges'
@@ -17,6 +17,7 @@ import { qqOnline, sendQQ } from './qq/api'
 import { MessageRow, Store } from './store'
 import { Stats } from './stats'
 import { TranslationOutcome, TranslationService } from './translate/service'
+import { commandWord, rootPrefixes } from './translate/skip'
 import { deletedReplyLine, prefixFor, replyLine, stripOwnDecorations } from './text/reply'
 import type { FileData, Msg } from './types'
 import { compareSnowflake, dateIn, Limiter, OrderedQueues, SeenSet, snowflakeFromTime, TtlCache } from './util'
@@ -76,6 +77,10 @@ export class Relay {
   translation: TranslationService
   /** 自检发现的问题：桥 key → 问题。 */
   health = new Map<string, string[]>()
+  /** 本插件注册的命令（registerCommands 填进来）；这些命令和它们的子命令不转发（A8）。 */
+  ownCommands = new Set<Command>()
+  /** 注册 bridge.xxx 时自动建出来的上级命令（bridge）：它的子命令都算本插件的，单独一个词不算。 */
+  ownGroups = new Set<Command>()
   private queues = new OrderedQueues()
   /** 两个方向各用一个预处理限流器，一个方向堵住不影响另一个（R8）。 */
   private limiters: Record<Direction, Limiter> = { d2q: new Limiter(4), q2d: new Limiter(4) }
@@ -370,6 +375,37 @@ export class Relay {
     })
   }
 
+  /**
+   * 这条消息是不是本插件自己的命令（A8）：第一个词（有配置前缀时去掉一个）解析到的命令，
+   * 或者它的上级命令，是本插件注册的。带不带前缀都算；其他插件的命令照常转发。
+   * 和 Koishi 一样，`bridge status` 这种空格写法也算 bridge.status；只有 `bridge` 一个词（例如「bridge is down」）不算。
+   */
+  isOwnCommand(text: string): boolean {
+    if (!this.ownCommands.size && !this.ownGroups.size) return false
+    const word = commandWord(text, rootPrefixes(this.ctx.root.config))
+    if (!word) return false
+    const rest = text.trim().split(/\s+/).slice(1, 3)
+    let command: any
+    try {
+      command = this.ctx.$commander.resolve(word)
+      // 后面的词能接成子命令就用子命令
+      let name = word
+      for (const next of rest) {
+        const sub = command && this.ctx.$commander.resolve(`${name}.${next}`)
+        if (!sub) break
+        command = sub
+        name = `${name}.${next}`
+      }
+    } catch {
+      return false
+    }
+    if (!command || this.ownGroups.has(command)) return false
+    for (let c = command; c; c = c.parent) {
+      if (this.ownCommands.has(c) || this.ownGroups.has(c)) return true
+    }
+    return false
+  }
+
   // ---------------------------------------------------------------- lastseen
 
   private markSeen(channelId: string, id: string) {
@@ -433,6 +469,9 @@ export class Relay {
     // 3. 找桥
     const bridges = bridgesFrom(this.settings, 'discord', d.channel_id)
     if (!bridges.length) return
+    // 本插件的命令不转发（A8）；开头 @ 机器人的也算
+    const content = String(d.content ?? '').replace(/^\s*<@!?(\d+)>/, (all, id) => (bot?.selfId && id === bot.selfId ? '' : all))
+    if (this.isOwnCommand(content)) return void this.logger.debug(`Discord 频道 ${d.channel_id} 的消息 ${d.id} 是本插件的命令，不转发`)
     // 4. 暂停
     const active = bridges.filter((b) => !this.isPaused(b))
     if (!active.length) return
@@ -638,6 +677,10 @@ export class Relay {
     if (session.userId === session.selfId) return
     const bridges = bridgesFrom(this.settings, 'onebot', session.channelId!)
     if (!bridges.length) return
+    // 本插件的命令不转发（A8）；stripped.content 已经去掉了开头的 @机器人
+    if (this.isOwnCommand(session.stripped?.content ?? session.content ?? '')) {
+      return void this.logger.debug(`QQ 群 ${session.channelId} 的消息 ${session.messageId} 是本插件的命令，不转发`)
+    }
     const delay = this.settings.qqReorderMs
     if (delay > 0) return this.buffer(session, delay, () => this.dispatchQQ(session, bridges))
     this.dispatchQQ(session, bridges)
@@ -1028,37 +1071,56 @@ export class Relay {
     const discord = this.discordBot()
     const qq = this.qqBot()
     if (!discord || !qq || !qqOnline(qq)) return
+    // 同一个频道、同一个群每次自检只查一次（A8）：多个桥指向同一个群时共用结果。返回问题，没问题返回 null
+    const once = new Map<string, Promise<string | null>>()
+    const check = (key: string, fn: () => Promise<string | null>) => {
+      let result = once.get(key)
+      if (!result) once.set(key, result = fn())
+      return result
+    }
     for (const bridge of this.settings.bridges) {
-      const problems: string[] = []
-      try {
-        const raw = await discord.internal.getChannel(bridge.discord)
-        if (raw?.guild_id) this.guildOf.set(bridge.discord, raw.guild_id)
-      } catch (e) {
-        problems.push(`取不到 Discord 频道（${describeError(e)}）`)
-      }
+      const problems: (string | null)[] = []
+      problems.push(await check(`channel:${bridge.discord}`, async () => {
+        try {
+          const raw = await discord.internal.getChannel(bridge.discord)
+          if (raw?.guild_id) this.guildOf.set(bridge.discord, raw.guild_id)
+          return null
+        } catch (e) {
+          return `取不到 Discord 频道（${describeError(e)}）`
+        }
+      }))
       if (this.settings.discordAsWebhook && bridge.direction !== 'd2q') {
+        problems.push(await check(`webhook:${bridge.discord}`, async () => {
+          try {
+            await this.sender.ensureWebhook(discord, bridge.discord, true)
+            return null
+          } catch (e) {
+            const info = internalErrorInfo(e)
+            return info.code === 50013 || info.status === 403 ? 'webhook 不可用（机器人没有「管理 Webhook」权限），改由机器人发送' : `webhook 不可用（${describeError(e)}）`
+          }
+        }))
+      }
+      problems.push(await check(`group:${bridge.qq}`, async () => {
         try {
-          await this.sender.ensureWebhook(discord, bridge.discord, true)
+          await qq.getGuild(bridge.qq)
+          return null
         } catch (e) {
-          const info = internalErrorInfo(e)
-          problems.push(info.code === 50013 || info.status === 403 ? 'webhook 不可用（机器人没有「管理 Webhook」权限），改由机器人发送' : `webhook 不可用（${describeError(e)}）`)
+          return `取不到 QQ 群（${describeError(e)}）`
         }
-      }
-      try {
-        await qq.getGuild(bridge.qq)
-      } catch (e) {
-        problems.push(`取不到 QQ 群（${describeError(e)}）`)
-      }
+      }))
       if (bridge.atAll) {
-        try {
-          if (!(await this.gate.isAdmin(qq, bridge.qq, true))) problems.push('⚠ 不是管理员')
-        } catch (e) {
-          problems.push(`查不到机器人在群里的身份（${describeError(e)}）`)
-        }
+        problems.push(await check(`admin:${bridge.qq}`, async () => {
+          try {
+            return (await this.gate.isAdmin(qq, bridge.qq, true)) ? null : '⚠ 不是管理员'
+          } catch (e) {
+            return `查不到机器人在群里的身份（${describeError(e)}）`
+          }
+        }))
       }
-      if (problems.length) {
-        this.health.set(bridge.key, problems)
-        this.logger.warn(`第 ${bridge.index} 个桥：${problems.join('；')}`)
+      const found = problems.filter((p): p is string => !!p)
+      if (found.length) {
+        this.health.set(bridge.key, found)
+        this.logger.warn(`第 ${bridge.index} 个桥：${found.join('；')}`)
       } else {
         this.health.delete(bridge.key)
       }
