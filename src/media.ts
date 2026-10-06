@@ -24,12 +24,26 @@ export interface DownloadOptions {
   maxBytes?: number
 }
 
-class TooLarge extends Error {}
+export class TooLarge extends Error {}
+
+/** 服务器回复了错误状态（4xx、5xx，或者 2xx、304 以外的状态）。body 没有读。 */
+export class HttpStatusError extends Error {
+  constructor(readonly status: number) {
+    super(`HTTP ${status}`)
+    this.name = 'HttpStatusError'
+  }
+}
 
 // 自定义 responseType：拿到 fetch 的 Response 后自己读 body。
 // Content-Length 超上限立即取消；否则分块累计，超上限立即取消（不会把整个文件读进内存）。
-function limitedBody(maxBytes: number | undefined, signal?: AbortSignal) {
+// 调用时要带 validateStatus: () => true：不然 http 库遇到 4xx、5xx 会先用默认方式把整个错误页读进内存再报错，
+// 绕过这里的大小上限。错误状态在这里处理：不读 body，直接取消，抛 HttpStatusError（304 照常返回空内容）。
+export function limitedBody(maxBytes: number | undefined, signal?: AbortSignal) {
   return async (raw: Response): Promise<ArrayBuffer> => {
+    if (!raw.ok && raw.status !== 304) {
+      await raw.body?.cancel().catch(() => {})
+      throw new HttpStatusError(raw.status)
+    }
     const limit = maxBytes && maxBytes > 0 ? maxBytes : Infinity
     const length = Number(raw.headers.get('content-length') ?? NaN)
     if (Number.isFinite(length) && length > limit) {
@@ -85,6 +99,8 @@ export async function download(ctx: Context, media: Media, options: DownloadOpti
         const response = await ctx.http(url, {
           method: 'GET',
           responseType: limitedBody(maxBytes, signal),
+          // 所有状态都交给 limitedBody：错误页不读内容（见上面）
+          validateStatus: () => true,
           timeout: options.timeout ?? 20000,
           signal,
         })

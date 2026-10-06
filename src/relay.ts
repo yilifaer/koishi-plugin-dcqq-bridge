@@ -51,6 +51,8 @@ export interface RelayOptions {
   /** 测试时关掉定时任务。 */
   timers?: boolean
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>
+  /** 测试用：在线词表的检查间隔（毫秒），不填时按 glossary.refreshHours。 */
+  onlineRefreshMs?: number
 }
 
 interface Prepared {
@@ -195,6 +197,8 @@ export class Relay {
       this.ctx.setInterval(() => void this.hourly().catch(() => {}), 3600000)
     }
     await this.translation.reload().catch((e) => this.logger.warn('读取关键词、术语表出错：%s', describeError(e)))
+    // 在线词表：上面已经用了缓存，这里才在后台下载（不等），之后定时检查（0.4.0）
+    if (!this.disposed) this.translation.startOnline(this.options.onlineRefreshMs)
     await this.hourly().catch(() => {})
     // 插件启动（重载）时 Discord 机器人已经在线：不补发，lastseen 设成频道最新的消息（A2）
     const bot = this.discordBot()
@@ -268,6 +272,8 @@ export class Relay {
   async dispose() {
     this.disposed = true
     this.abort.abort()
+    // 在线词表：停掉定时检查，正在下载的结果不再使用
+    this.translation.dispose()
     if (this.checkTimer) clearTimeout(this.checkTimer)
     // 最后一次写入：dispose 之后其他地方都不再写 lastseen（F2）
     if (this.starting && this.loadedDone) {

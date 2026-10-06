@@ -7,8 +7,10 @@ import { resolve } from 'node:path'
 import type { Context } from 'koishi'
 import type { Settings } from '../bridges'
 import { KeywordFilter, Moderator, parseKeywordLines, resolveModerationKey } from '../filter'
-import { buildGlossary, Glossary, loadCommonWords, loadEveData, mergeSlangFiles, parseSlangYaml, splitSlangPaths } from '../glossary'
-import type { SlangFileResult, SlangFileSummary } from '../glossary'
+import { buildGlossary, Glossary, isUrlEntry, loadCommonWords, loadEveData, mergeSlangFiles, parseOnlineEveData, parseSlangYaml, splitSlangPaths, splitUrls } from '../glossary'
+import type { EveData, OnlineEveResult, SlangFileResult, SlangFileSummary } from '../glossary'
+import { OnlineSources } from '../online'
+import type { CheckResult, OnlineKind, OnlineSpec } from '../online'
 import { fixToEntry, loadFixRows } from '../fixes'
 import type { Msg } from '../types'
 import { Translator } from './client'
@@ -36,6 +38,43 @@ export function trimLines(text: string) {
   return text.replace(/[^\S\n]+$/gm, '').trim()
 }
 
+/** 正在用的官方名称表（给 bridge.status、bridge.reload 显示，0.4.0） */
+export interface OfficialInfo {
+  /** online：在线表（刚下载的或缓存）；bundled：插件自带 */
+  from: 'online' | 'bundled'
+  buildNumber: number
+  count: number
+  /** 在线表的文件名 */
+  name?: string
+  /** 在线表最近一次确认是最新的时间 */
+  savedAt?: number
+  /** 从插件自带的表补上 cat 的条数 */
+  catFilled?: number
+  /** 配了在线表却没用上的原因 */
+  note?: string
+}
+
+/** 配置里的在线来源（0.4.0）：黑话表里网址开头的项、在线官方名称表。写错的部分放进 problems。 */
+export function onlineSpecs(settings: Settings): { specs: OnlineSpec[]; problems: string[] } {
+  const specs: OnlineSpec[] = []
+  const problems: string[] = []
+  splitSlangPaths(settings.glossary.slangFile).forEach((entry, i) => {
+    if (!isUrlEntry(entry)) return
+    const { urls, bad } = splitUrls(entry)
+    for (const b of bad) problems.push(`黑话表第 ${i + 1} 项里的「${b}」不是 http(s) 网址，已忽略`)
+    if (urls.length) specs.push({ kind: 'slang', urls, active: true })
+  })
+  if (settings.glossary.officialUrl) {
+    const { urls, bad } = splitUrls(settings.glossary.officialUrl)
+    for (const b of bad) problems.push(`在线官方名称表里的「${b}」不是 http(s) 网址，已忽略`)
+    if (urls.length) {
+      specs.push({ kind: 'official', urls, active: settings.glossary.eve })
+      if (!settings.glossary.eve) problems.push('填了在线官方名称表，但没有打开「EVE 官方名称表」，不下载')
+    }
+  }
+  return { specs, problems }
+}
+
 export class TranslationService {
   glossary: Glossary | null = null
   /** QQ 群成员名片缓存（U7），由 Relay 设置。 */
@@ -45,6 +84,13 @@ export class TranslationService {
   problems: string[] = []
   /** 各个黑话表文件读到的条数（给 bridge.reload 的回复用，T8） */
   slangFiles: SlangFileSummary[] = []
+  /** 在线黑话表、官方名称表（0.4.0） */
+  online: OnlineSources
+  /** 正在用的官方名称表；没打开官方名称表时为 null */
+  official: OfficialInfo | null = null
+  private bundledEve: EveData | null | undefined
+  private reloading: Promise<void> = Promise.resolve()
+  private disposed = false
   /** 各种原因的计数（跳过和失败都算）。 */
   outcomes = new Map<string, number>()
   translator: Translator
@@ -72,6 +118,46 @@ export class TranslationService {
         apiKey: resolveModerationKey(s.translate.baseURL, s.translate.apiKey, s.filter.moderationBaseURL, s.filter.moderationApiKey),
       }
     })
+    this.online = new OnlineSources(ctx, logger, (kind, text) => this.checkOnline(kind, text), now)
+  }
+
+  /** 插件自带的官方名称表，只读一次 */
+  private bundled(): EveData | null {
+    if (this.bundledEve === undefined) this.bundledEve = loadEveData()
+    return this.bundledEve
+  }
+
+  /**
+   * 下载到的、缓存里的内容能不能用（0.4.0）。不能用的不替换手上的版本。
+   * 在线黑话表一条能用的词条都没有（只有注释、`~`、`---`、空列表、每一条都写错）也不用：
+   * 多半是镜像或代理给的维护页、错误内容，换上去会把好的表和缓存都冲掉。本地文件不受影响，照旧当作 0 条。
+   */
+  private checkOnline(kind: OnlineKind, text: string): CheckResult {
+    if (kind === 'slang') {
+      const parsed = parseSlangYaml(text)
+      if (parsed.fatal) return { error: parsed.fatal }
+      return parsed.entries.length ? {} : { error: '没有可用的词条' }
+    }
+    const result = parseOnlineEveData(text, this.bundled())
+    return result.error ? { error: result.error } : { value: result }
+  }
+
+  /**
+   * 启动后台检查在线词表（启动时调用一次）：马上下载一次（不等），之后每隔 refreshHours 小时一次；
+   * 内容变了就重建术语表（翻译缓存随之失效）。intervalMs 只给测试用。
+   */
+  startOnline(intervalMs?: number) {
+    const hours = this.getSettings().glossary.refreshHours
+    this.online.start(intervalMs ?? Math.round(hours * 3600000), async () => {
+      if (this.disposed) return
+      this.logger.info('在线词表有更新，重新加载术语表')
+      await this.reload().catch((e) => this.logger.warn(`重新加载术语表出错：${e?.message ?? e}`))
+    })
+  }
+
+  dispose() {
+    this.disposed = true
+    this.online.dispose()
   }
 
   /** 审核打开却没有可用的 key（清单 §4.5）。 */
@@ -84,10 +170,25 @@ export class TranslationService {
     return resolve(this.ctx.baseDir ?? process.cwd(), file)
   }
 
-  /** 读取关键词和术语表（启动时和 bridge.reload 时）。出错只记下来，不影响转发。 */
-  async reload() {
+  /**
+   * 读取关键词和术语表（启动时和 bridge.reload 时）。出错只记下来，不影响转发。
+   * fetch：先下载一次所有在线词表再读（bridge.reload 用）；不带时只用手上的版本（启动时是缓存），不等网络。
+   * 几次 reload 同时发生时按顺序一个一个来。
+   */
+  reload(options: { fetch?: boolean } = {}): Promise<void> {
+    const run = this.reloading.then(() => this.doReload(options))
+    this.reloading = run.catch(() => {})
+    return run
+  }
+
+  private async doReload(options: { fetch?: boolean }) {
     const s = this.getSettings()
     const problems: string[] = []
+    // 在线词表（0.4.0）：先按配置建好来源、读缓存（不连网）；bridge.reload 时再下载一次
+    const online = onlineSpecs(s)
+    problems.push(...online.problems)
+    await this.online.sync(online.specs)
+    if (options.fetch) await this.online.refreshAll()
     // 关键词
     const lines = parseKeywordLines(s.filter.keywords)
     if (s.filter.keywordFile) {
@@ -112,7 +213,23 @@ export class TranslationService {
     const paths = splitSlangPaths(s.glossary.slangFile)
     const files: SlangFileResult[] = []
     for (const file of paths) {
-      const where = paths.length > 1 ? `黑话表 ${file}` : '黑话表'
+      let where = paths.length > 1 ? `黑话表 ${file}` : '黑话表'
+      // 在线黑话表：用下载到的（或缓存里的）内容，和本地文件一样合并
+      if (isUrlEntry(file)) {
+        const first = splitUrls(file).urls[0]
+        const source = first ? this.online.get('slang', first) : undefined
+        if (!first || !source) continue
+        where = `在线黑话表 ${source.name}`
+        if (source.text === null) {
+          // 没有可用版本的提示由 bridge.status、bridge.reload 实时显示（这里写的话下载失败后不会更新）
+          files.push({ path: first, online: true, entries: null, error: source.error?.reason ?? '还没下载到', warnings: [] })
+          continue
+        }
+        const parsed = parseSlangYaml(source.text)
+        files.push({ path: first, online: true, entries: parsed.entries, warnings: parsed.warnings })
+        problems.push(...parsed.warnings.map((w) => `${where}：${w}`))
+        continue
+      }
       try {
         const parsed = parseSlangYaml(await readFile(this.path(file), 'utf8'))
         files.push({ path: file, entries: parsed.entries, warnings: parsed.warnings })
@@ -126,10 +243,28 @@ export class TranslationService {
     }
     const mergedSlang = mergeSlangFiles(files)
     this.slangFiles = mergedSlang.summary
-    let eveData = null
+    let eveData: EveData | null = null
+    this.official = null
     if (s.glossary.eve) {
-      eveData = loadEveData()
-      if (!eveData) problems.push('插件自带的 EVE 名称表读不到')
+      const bundled = this.bundled()
+      const first = splitUrls(s.glossary.officialUrl).urls[0]
+      const source = first ? this.online.get('official', first) : undefined
+      const remote = (source?.value as OnlineEveResult | undefined)?.data
+      let note: string | undefined
+      if (source && !remote) note = source.error ? `在线表读不到（${source.error.reason}）` : '在线表还没下载到'
+      // 在线表比插件自带的旧（例如断网很久只剩旧缓存、插件又升级了）：用插件自带的
+      if (remote && bundled && bundled.buildNumber > remote.buildNumber) note = `在线表 build ${remote.buildNumber} 比插件自带的旧`
+      if (remote && !note) {
+        eveData = remote
+        this.official = {
+          from: 'online', buildNumber: remote.buildNumber, count: remote.entries.length, name: source!.name, savedAt: source!.savedAt,
+          catFilled: (source!.value as OnlineEveResult).catFilled,
+        }
+      } else {
+        eveData = bundled
+        if (!eveData) problems.push('插件自带的 EVE 名称表读不到')
+        this.official = { from: 'bundled', buildNumber: bundled?.buildNumber ?? 0, count: bundled?.entries.length ?? 0, note }
+      }
     }
     // 纠错命令加的词条（B14），存在数据库里
     let fixes = null

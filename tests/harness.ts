@@ -11,6 +11,7 @@ import { OneBot, OneBotBot } from 'koishi-plugin-adapter-onebot'
 import { registerCommands } from '../src/commands'
 import type { BridgeRow, Config } from '../src/config'
 import { Relay } from '../src/relay'
+import type { RelayOptions } from '../src/relay'
 import { extendModels } from '../src/store'
 
 export const DC_BOT = '900000000000000001'
@@ -292,7 +293,14 @@ export function qqPayload(message: any, extra: Record<string, any> = {}): any {
   }
 }
 
-export async function setup(patch: Partial<Config> = {}, options: { online?: boolean; before?: (env: { discord: FakeDiscord; qq: FakeQQ }) => void } = {}): Promise<Env> {
+export async function setup(patch: Partial<Config> = {}, options: {
+  online?: boolean
+  before?: (env: { discord: FakeDiscord; qq: FakeQQ }) => void
+  /** Koishi 实例目录（0.4.0 在线词表的缓存放在这下面）；不填时是当前目录 */
+  baseDir?: string
+  /** 额外的 Relay 选项（例如在线词表的检查间隔） */
+  relay?: Partial<RelayOptions>
+} = {}): Promise<Env> {
   const discord = new FakeDiscord()
   await discord.start()
   discord.channels.set(DC_CHANNEL, { id: DC_CHANNEL, guild_id: DC_GUILD, name: '测试频道' })
@@ -320,6 +328,7 @@ export async function setup(patch: Partial<Config> = {}, options: { online?: boo
   }
 
   const app = new Context()
+  if (options.baseDir) (app as any).baseDir = options.baseDir
   app.plugin(HTTP as any)
   app.plugin(Memory as any)
   let dcBot: any
@@ -339,7 +348,7 @@ export async function setup(patch: Partial<Config> = {}, options: { online?: boo
     inject: ['database', 'http'],
     apply(ctx: Context) {
       extendModels(ctx)
-      relay = new Relay(ctx, config, { timers: false, now: () => clock.now, sleep: (ms) => new Promise((r) => setTimeout(r, Math.min(ms, 50))) })
+      relay = new Relay(ctx, config, { timers: false, now: () => clock.now, sleep: (ms) => new Promise((r) => setTimeout(r, Math.min(ms, 50))), ...options.relay })
       relay.install()
       registerCommands(ctx, relay)
     },

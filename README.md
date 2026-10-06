@@ -32,7 +32,7 @@ A [Koishi](https://koishi.chat/) plugin that bridges **Discord channels** and **
 - **屏蔽词**：每个桥单独设置，检查正文、embed 和文件名。
 - **自动翻译**（默认关闭，按桥打开）：英译中、中译英，原文和【机翻】译文在同一条消息里；支持任何 OpenAI 兼容接口，不预设服务商。翻译失败、超时、被过滤时只发原文。
 - **过滤**（默认关闭）：关键词表，外加可选的 OpenAI 审核接口；命中就不附译文，原文照常转发。
-- **EVE 术语表**（默认关闭）：插件自带从 CCP 官方数据生成的物品、组别、星系、星域中英文名；可以加载自己的黑话表文件。星系写成 `Jita(吉他)`，`1DQ1-A` 这类代号星系永远不翻。
+- **EVE 术语表**（默认关闭）：插件自带从 CCP 官方数据生成的物品、组别、星系、星域中英文名；可以加载自己的黑话表文件，黑话表和官方名称表也可以填网址、定时在线更新。星系写成 `Jita(吉他)`，`1DQ1-A` 这类代号星系永远不翻。
 - **管理命令**：查看状态、暂停（可以只暂停翻译）、恢复、重新读取词表、从旧插件导入配置。
 
 ## 安装
@@ -196,6 +196,8 @@ FC;;FC Name;;Fleet Commander;;Fleet Name;;Comms;;Formup Location
 | `eve` | 关 | 使用插件自带的 EVE 官方名称表（`data/eve-glossary.json`） |
 | `systemStyle` | `en(zh)` | 有名字的星系、星域、星座在英译中时怎么写：`Jita(吉他)` / `Jita` / `吉他` |
 | `slangFile` | 空 | 黑话表文件（YAML，相对 Koishi 实例目录）；多个文件用 `;;` 分隔，见下面「多个黑话表文件」 |
+| `officialUrl` | 空 | 在线的官方名称表网址（JSON），`\|\|` 分隔备用网址；空 = 用插件自带的表。见下面「在线黑话表和官方名称表」 |
+| `refreshHours` | `6` | 在线词表每隔几小时检查一次更新，最长 `168`（一周），填更大的按 168 算；`0` = 只在插件启动和 `bridge.reload` 时检查 |
 | `overrides` | 空 | 自己加的词条（表格），优先级最高（和群里 `纠错` 命令加的词条同级，同一个原文以这里为准） |
 
 **黑话表格式**见插件自带的 [`data/eve-slang.example.yaml`](data/eve-slang.example.yaml)。每一条：
@@ -217,7 +219,47 @@ data/eve-cn-slang/glossary.yaml;;data/dcqq-bridge/local-slang.yaml
 - 每个文件单独读：一个文件读不到或 YAML 写错，只在 `bridge.status` 和日志里提示这个文件，其他文件照常加载。
 - `bridge.reload` 的回复里按文件列出条数，例如「黑话表：glossary.yaml 301 条，local-slang.yaml 2 条」。
 - 只写一个路径时和以前完全一样。
-- 可以直接用开源的中文黑话表：[github.com/yilifaer/eve-cn-slang](https://github.com/yilifaer/eve-cn-slang)（`glossary.yaml`），克隆或下载到 Koishi 实例目录下，把路径写进 `slangFile`。
+- 可以直接用开源的中文黑话表：[github.com/yilifaer/eve-cn-slang](https://github.com/yilifaer/eve-cn-slang)（`glossary.yaml`），克隆或下载到 Koishi 实例目录下，把路径写进 `slangFile`；也可以直接写网址，见下一节。
+
+#### 在线黑话表和官方名称表
+
+黑话表和官方名称表可以放在 GitHub 等网站上，插件定时下载。改了数据仓库里的文件，各个机器人过几小时自己就用上新的，不用发新版插件、也不用每台机器手动更新。默认不开（网址都是空的）。
+
+**设置步骤**（以 [eve-cn-slang](https://github.com/yilifaer/eve-cn-slang) 为例，换成自己的仓库时把网址里的用户名、仓库名、分支名改掉）：
+
+1. 打开插件配置的「术语表」，打开 `eve`（EVE 官方名称表）。
+2. `slangFile` 填黑话表的网址；`||` 后面是备用网址（GitHub 打不开时用 jsDelivr 的镜像）。还想加自己联盟专用的几条，就用 `;;` 再接一个本地文件，写在后面的覆盖前面的：
+
+   ```
+   https://raw.githubusercontent.com/yilifaer/eve-cn-slang/main/glossary.yaml || https://cdn.jsdelivr.net/gh/yilifaer/eve-cn-slang@main/glossary.yaml ;; data/dcqq-bridge/local-slang.yaml
+   ```
+
+3. `officialUrl` 填官方名称表的网址，同样可以加备用网址：
+
+   ```
+   https://raw.githubusercontent.com/yilifaer/eve-cn-slang/main/official/eve-official.json || https://cdn.jsdelivr.net/gh/yilifaer/eve-cn-slang@main/official/eve-official.json
+   ```
+
+4. `refreshHours` 默认 6 小时检查一次，一般不用改（最长 168 小时，也就是一周）。保存配置。
+5. 私聊机器人发 `bridge.reload`，回复里应该有「glossary.yaml（在线）N 条，更新于 …」和「官方名称表：eve-official.json（在线）build N，N 条，更新于 …」。
+
+**规则**：
+- `slangFile` 里网址和本地文件可以混着写，按顺序合并，覆盖规则和多个本地文件完全一样（见上一节）。一项里用 `||` 分隔的网址按顺序试，第一个下载成功的为准。
+- 下载用 Koishi 的 HTTP 服务，每次最多等 30 秒；黑话表最大 5 MB，官方名称表最大 20 MB。服务器回复错误（404、500 等）时不读错误页的内容，直接算这个网址下载失败。支持 ETag / Last-Modified，文件没变时服务器只回一句「没变」，不重新下载整份。
+- **内容没变就什么都不做**；变了才重新加载术语表，翻译缓存随之失效（同一句话按新词条重新翻译）。
+- **下载到的内容会先检查**：黑话表必须是 YAML 列表，并且至少有一条能用的词条（拿到错误页、空文件、只有注释的文件、空列表就不用；本地黑话表文件不受这一条影响）；官方名称表必须有 `buildNumber` 和 `entries`，每一条都有 `kind`、`en`、`zh`，写了 `count` 时要和条数一样，条数至少是插件自带表的一半。检查不通过就继续用原来的版本，并在 `bridge.status` 里写原因。
+- eve-cn-slang 的官方名称表已经自己写了 `cat` 字段（区分舰船、建筑），插件直接用文件里的，所以「末日沙场」这种不带「级」的船名照样认得。只有整份表一条 `cat` 都没有时（例如自己做的、没写 `cat` 的表），插件才按英文名从自带的表补上。
+- 在线官方名称表的 build 比插件自带的旧时（例如断网很久、只剩旧缓存，插件又升级了），用插件自带的。
+- `bridge.status` 显示正在用的官方名称表（在线还是插件自带、build 号）和每个在线黑话表最近一次下载成功的时间；下载失败时写原因和时间。
+
+**断网或网站打不开时**：
+- 每次下载成功都存一份在 Koishi 实例目录的 `data/dcqq-bridge/cache/` 下。插件启动时先用这份缓存，再在后台下载，**启动和转发都不等网络**。
+- 下载失败就继续用手上的版本：这次运行里下载过的 → 缓存 → 都没有时官方名称表用插件自带的、在线黑话表当作读不到（其他黑话表文件照常）。连续失败只在日志里写一次，恢复时再写一次。
+- `bridge.reload` 会马上把所有在线词表下载一次，并逐个报告，例如「glossary.yaml（在线）读不到（raw.githubusercontent.com 超时；cdn.jsdelivr.net 超时），用的是 10/05 08:00 (UTC+8) 的缓存，301 条」。
+
+**缓存只留一份**：每个网址（按 `||` 前面的第一个网址算）只留一份内容和一个记录文件（ETag 等），新版本下载好后先写临时文件再替换旧的，不会越存越多。内容写进去了才更新记录；记录里存着内容的校验值，对不上（例如上次写到一半）时重新下载整份，不会把旧内容当成最新的。插件启动和 `bridge.reload` 时删掉已经不在配置里的网址的缓存、以及上次没写完留下的临时文件。改了第一个网址或者调换了 `||` 前后的顺序时，只要新旧网址里有一个相同，旧的缓存改成新的文件名接着用（断网时把镜像调到前面也不会丢），不算「不在配置里」。只删插件自己按固定格式命名的文件，缓存目录里别的文件不动。
+
+**版权**：eve-cn-slang 的 `official/` 目录（官方名称表）和插件自带的 `data/eve-glossary.json` 一样来自 CCP 的游戏数据，按 EVE 开发者许可协议使用（仅限非商业、非营利用途），不适用那个仓库的 CC BY 4.0；声明见该仓库的 `official/NOTICE.md` 和本插件的 `data/NOTICE`。
 
 **匹配规则**：
 - 最长的优先；
@@ -257,7 +299,7 @@ data/eve-cn-slang/glossary.yaml;;data/dcqq-bridge/local-slang.yaml
 | `bridge.status [桥]`（`桥接状态`） | 每个桥的状态：启用、暂停或无效，最近一次转发时间，24 小时转发数和失败数，最近一次失败的原因。@全体 桥还显示今天用了几次、剩余次数（每次执行命令时实时向 QQ 查询，最多等 8 秒；查不到时写明原因，例如「查询失败：超时」「QQ 机器人不在线」）、改发文字的次数和原因。在群里只显示和这个群有关的桥；私聊时加 `-a` 连无效、未启用的行也显示 |
 | `bridge.pause [桥]`（`桥接暂停`） | 暂停。不带桥 = 全局暂停，所有转发立即停止。重启后仍然有效。加 `-t` 只暂停翻译，转发照常 |
 | `bridge.resume [桥]`（`桥接恢复`） | 恢复；加 `-t` 只恢复翻译 |
-| `bridge.reload` | 重新读取关键词文件和黑话表 |
+| `bridge.reload` | 重新读取关键词文件和黑话表；在线黑话表、官方名称表马上下载一次 |
 | `bridge.import` | 从 @myrtus/forward 的配置生成桥（只能私聊使用，只输出、不改任何配置） |
 | `bridge.fix`（`纠错`） | 在群里加、改、删术语词条，马上生效，见上面「术语表」一节 |
 
@@ -328,6 +370,8 @@ npm run build
 - `data/eve-glossary.json`：从 CCP 的 EVE Online 静态数据生成，按 [EVE 开发者许可协议](https://developers.eveonline.com/license-agreement) 使用（仅限非商业、非营利用途）。用 `npm run build:glossary` 可以从官方最新数据重新生成。
 
   © 2014 CCP hf. All rights reserved. "EVE", "EVE Online", "CCP", and all related logos and images are trademarks or registered trademarks of CCP hf.
+
+- 在线官方名称表（`officialUrl`，例如 eve-cn-slang 的 `official/eve-official.json`）同样是 CCP 游戏数据的衍生物，许可和版权声明同上；下载后的缓存也一样。
 
 - `data/common-words.txt`：常用英语单词表，取自 SCOWL（Spell Checker Oriented Word Lists，经 npm 包 wordlist-english）的第 10、20、35 级，按 SCOWL 的许可使用，版权声明原文见 `data/NOTICE`。
 

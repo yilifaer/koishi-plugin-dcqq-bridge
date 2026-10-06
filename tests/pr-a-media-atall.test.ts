@@ -27,8 +27,8 @@ beforeAll(async () => {
     hits.push(hit)
     res.on('close', () => { hit.closedAt = Date.now() })
     // 慢慢写：每 20ms 写 64 KiB，直到连接关闭或写满 total 字节
-    const slow = (total: number, withLength: boolean) => {
-      res.writeHead(200, withLength ? { 'content-type': 'image/png', 'content-length': String(total) } : { 'content-type': 'image/png' })
+    const slow = (total: number, withLength: boolean, status = 200, type = 'image/png') => {
+      res.writeHead(status, withLength ? { 'content-type': type, 'content-length': String(total) } : { 'content-type': type })
       const chunk = Buffer.alloc(64 * 1024, 7)
       const timer = setInterval(() => {
         if (res.destroyed || hit.written >= total) {
@@ -50,6 +50,9 @@ beforeAll(async () => {
       slow(512 * 1024 * 1024, false)
     } else if (req.url === '/slow-small') {
       slow(10 * 64 * 1024, false)
+    } else if (req.url === '/error-page') {
+      // 404 带一个 4 MB 的错误页（慢慢写，全部读完要 1 秒多）
+      slow(4 * 1024 * 1024, false, 404, 'text/html')
     } else {
       res.writeHead(404).end()
     }
@@ -104,6 +107,16 @@ describe('A3 download 大小上限', () => {
     const hit = hits.find((h) => h.path === '/huge-chunked')
     expect(await waitClosed(hit)).toBeTruthy()
     expect(hit!.written).toBeLessThan(2 * 1024 * 1024)
+  })
+
+  it('服务器回复 404 带很大的错误页：不读错误页，马上返回 null', async () => {
+    const start = Date.now()
+    const file = await download(app, media('/error-page'), { maxBytes: 10 * 1024 * 1024 })
+    expect(file).toBeNull()
+    expect(Date.now() - start).toBeLessThan(1000)
+    const hit = hits.find((h) => h.path === '/error-page')
+    expect(await waitClosed(hit)).toBeTruthy()
+    expect(hit!.written).toBeLessThan(1024 * 1024)
   })
 
   it('正常图片：内容、mime、文件名不变', async () => {

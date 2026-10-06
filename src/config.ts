@@ -66,6 +66,9 @@ export interface GlossaryConfig {
   systemStyle: 'en(zh)' | 'en' | 'zh'
   slangFile: string
   overrides: Array<{ en: string; zh: string; mode: GlossaryMode; dir: GlossaryDir }>
+  // 可选：0.4.0 新增，旧的测试配置里没有这两个字段，运行时按空和 6 处理
+  officialUrl?: string
+  refreshHours?: number
 }
 
 export interface Config {
@@ -199,7 +202,11 @@ export const Config: Schema<Config> = Schema.intersect([
       ]).default('en(zh)').loose()
         .description('有名字的星系、星域、星座在英译中时怎么写。代号星系（例如 1DQ1-A）永远不翻。'),
       slangFile: str()
-        .description('黑话表文件路径（YAML，相对 Koishi 实例目录）。多个文件用 `;;` 分隔，按顺序加载，后面文件里同一个原文的词条覆盖前面的。格式见插件自带的 `data/eve-slang.example.yaml`。写错时只记错误，照常转发。用 `bridge.reload` 重新读取。'),
+        .description('黑话表文件路径（YAML，相对 Koishi 实例目录）。多个文件用 `;;` 分隔，按顺序加载，后面文件里同一个原文的词条覆盖前面的。也可以写网址（`https://` 开头），插件定时下载；一项里用 `||` 分隔备用网址，前一个下载不了就用下一个。格式见插件自带的 `data/eve-slang.example.yaml`。写错时只记错误，照常转发。用 `bridge.reload` 重新读取。'),
+      officialUrl: str()
+        .description('可选：在线的 EVE 官方名称表网址（JSON），用 `||` 分隔备用网址。留空 = 用插件自带的表。下载到的表检查格式和条数，不对就继续用原来的。要先打开上面的「EVE 官方名称表」才会下载。'),
+      refreshHours: num(6)
+        .description('在线的黑话表、官方名称表每隔几小时检查一次更新，最长 168（一周），填更大的按 168 算；0 = 只在插件启动和 `bridge.reload` 时检查。没有填网址时这一项不起作用。'),
       overrides: Schema.array(Schema.object({
         en: str().description('英文'),
         zh: str().description('中文'),
@@ -215,6 +222,6 @@ export const Config: Schema<Config> = Schema.intersect([
         ]).default('both').loose().description('方向'),
       })).role('table').default([]).loose()
         .description('自己加的词条，优先级最高。'),
-    }).default({} as GlossaryConfig).loose(),
+    }).default({} as Required<GlossaryConfig>).loose(),
   }).description('术语表'),
 ]) as Schema<Config>
