@@ -24,7 +24,11 @@ function readAliases(value: unknown, where: string, field: string, warnings: str
   return out
 }
 
-export function parseSlangYaml(text: string): { entries: SlangEntry[]; warnings: string[] } {
+/**
+ * fatal：整个文件不能用（YAML 解析失败、最外层不是列表）。在线黑话表下载到这种内容时不替换手上的旧版本（0.4.0）。
+ * 每一条里多出来的字段（category、note、confidence 等）直接忽略，不算错。
+ */
+export function parseSlangYaml(text: string): { entries: SlangEntry[]; warnings: string[]; fatal?: string } {
   const warnings: string[] = []
   const entries: SlangEntry[] = []
   let doc: unknown
@@ -33,12 +37,12 @@ export function parseSlangYaml(text: string): { entries: SlangEntry[]; warnings:
   } catch (e) {
     const reason = e instanceof Error ? e.message.split('\n')[0] : String(e)
     warnings.push(`黑话表 YAML 解析失败，当作没有黑话表：${reason}`)
-    return { entries, warnings }
+    return { entries, warnings, fatal: 'YAML 解析失败' }
   }
   if (doc === undefined || doc === null) return { entries, warnings }
   if (!Array.isArray(doc)) {
     warnings.push('黑话表的最外层应该是列表（每条以 `- en:` 开头），当作没有黑话表')
-    return { entries, warnings }
+    return { entries, warnings, fatal: '最外层不是列表' }
   }
   doc.forEach((item, i) => {
     const where = `黑话表第 ${i + 1} 条`
@@ -79,9 +83,41 @@ export function splitSlangPaths(value: string): string[] {
   return value.split(';;').map((p) => p.trim()).filter(Boolean)
 }
 
+/** `;;` 分出来的一项是不是网址（0.4.0 在线黑话表）：以 http:// 或 https:// 开头。 */
+export function isUrlEntry(entry: string): boolean {
+  return /^https?:\/\//i.test(entry.trim())
+}
+
+/** 一项里用 `||` 分隔的多个备用网址，按顺序；不是 http(s) 网址的放进 bad。 */
+export function splitUrls(entry: string): { urls: string[]; bad: string[] } {
+  const urls: string[] = []
+  const bad: string[] = []
+  for (const part of entry.split('||').map((p) => p.trim()).filter(Boolean)) {
+    if (/^https?:\/\/[^\s/]+/i.test(part) && !/\s/.test(part)) {
+      if (!urls.includes(part)) urls.push(part)
+    } else bad.push(part)
+  }
+  return { urls, bad }
+}
+
+/** 网址或路径的文件名部分（网址去掉 ? 和 # 后面的部分）。 */
+export function baseName(p: string): string {
+  let path = p
+  if (isUrlEntry(p)) {
+    try {
+      path = decodeURIComponent(new URL(p).pathname)
+    } catch {
+      path = p.split(/[?#]/)[0]
+    }
+  }
+  return path.split(/[\\/]/).filter(Boolean).pop() || p
+}
+
 export interface SlangFileResult {
-  /** 配置里写的路径 */
+  /** 配置里写的路径（在线黑话表是第一个网址） */
   path: string
+  /** 在线黑话表（0.4.0） */
+  online?: boolean
   /** 读到的词条（这个文件自己的，合并前）；读不到时为 null */
   entries: SlangEntry[] | null
   /** 读不到时的原因（例如 ENOENT） */
@@ -97,6 +133,8 @@ export interface SlangFileSummary {
   count: number | null
   /** 覆盖了前面文件里多少条词条（整条覆盖，或者 both 词条被覆盖了一个方向，都算一条） */
   replaced: number
+  /** 在线黑话表（0.4.0） */
+  online?: boolean
 }
 
 /** 词条用到的方向 */
@@ -125,7 +163,6 @@ export function mergeSlangFiles(files: SlangFileResult[]): {
   where: string[]
   summary: SlangFileSummary[]
 } {
-  const baseName = (p: string) => p.split(/[\\/]/).pop() || p
   const names = files.map((f) => baseName(f.path))
   const single = files.length === 1
   let merged: Array<{ entry: SlangEntry; where: string }> = []
@@ -150,7 +187,7 @@ export function mergeSlangFiles(files: SlangFileResult[]): {
       merged = next
     }
     entries.forEach((entry, j) => merged.push({ entry, where: single ? `黑话表第 ${j + 1} 条` : `黑话表 ${name} 第 ${j + 1} 条` }))
-    summary.push({ path: file.path, name, count: file.entries ? entries.length : null, replaced })
+    summary.push({ path: file.path, name, count: file.entries ? entries.length : null, replaced, ...(file.online ? { online: true } : {}) })
   })
   return { entries: merged.map((m) => m.entry), where: merged.map((m) => m.where), summary }
 }

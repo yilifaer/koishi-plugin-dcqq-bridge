@@ -10,9 +10,10 @@ import {
   consoleConflict, describeFix, fixArgText, FIX_USAGE, fixesToYaml, fixKey, fixToEntry, loadFixRows, originalOfForwarded, parseFixText,
 } from './fixes'
 import type { FixCommand } from './fixes'
-import { loadCommonWords, sourceTraits, userTermProblem } from './glossary'
+import { loadCommonWords, sourceTraits, splitUrls, userTermProblem } from './glossary'
 import { bridgesToYaml, convertOldConfig, findOldConfigs, formatReport } from './import'
 import { describeError } from './log'
+import type { OnlineSource } from './online'
 import { qqOnline } from './qq/api'
 import type { Relay } from './relay'
 import { splitText } from './text/split'
@@ -81,6 +82,42 @@ async function liveRemains(relay: Relay, filter: (b: { discord: string; qq: stri
   return result
 }
 
+/** 用到的在线来源（0.4.0）：手上的版本是哪来的。 */
+function versionText(source: OnlineSource, time: (ms: number) => string) {
+  if (source.text === null) return '还没有可用的版本'
+  return `用的是 ${time(source.savedAt)} 的${source.from === 'cache' ? '缓存' : '版本'}`
+}
+
+/** 官方名称表用的是哪一份（0.4.0）：在线表的文件名、build、条数、时间；插件自带的写 build。没打开官方名称表时不写。 */
+export function officialLines(relay: Relay, time: (ms: number) => string): string[] {
+  const info = relay.translation.official
+  if (!info) return []
+  const first = splitUrls(relay.settings.glossary.officialUrl).urls[0]
+  const source = first ? relay.translation.online.get('official', first) : undefined
+  if (info.from === 'online') {
+    const failed = source?.error ? `；⚠ 最近一次下载失败：${source.error.reason}（${time(source.error.at)}），继续用这一版` : ''
+    return [`官方名称表：${info.name}（在线）build ${info.buildNumber}，${info.count} 条，更新于 ${time(source?.savedAt ?? info.savedAt ?? 0)}${failed}`]
+  }
+  // 「在线表比自带的旧」保留；下载失败的原因按现在的状态写（重建术语表之后才失败的也能看到）
+  const notes: string[] = []
+  if (info.note?.startsWith('在线表 build')) notes.push(info.note)
+  if (source?.error) notes.push(`在线表读不到：${source.error.reason}（${time(source.error.at)}）`)
+  else if (!notes.length && info.note) notes.push(info.note)
+  return [`官方名称表：插件自带 build ${info.buildNumber}，${info.count} 条${notes.length ? `（${notes.join('；')}）` : ''}`]
+}
+
+/** bridge.status 里每个在线黑话表的状态：最近一次下载成功的时间；正在失败时写原因和用的是哪一版。 */
+function onlineSlangStatus(relay: Relay, time: (ms: number) => string): string[] {
+  const lines: string[] = []
+  for (const source of relay.translation.online.list()) {
+    if (source.kind !== 'slang') continue
+    const ok = source.savedAt ? `最近一次下载成功 ${time(source.savedAt)}` : '还没有下载成功过'
+    if (source.error) lines.push(`⚠ 在线黑话表 ${source.name}：下载失败：${source.error.reason}（${time(source.error.at)}），${versionText(source, time)}；${ok}`)
+    else lines.push(`在线黑话表 ${source.name}：${ok}`)
+  }
+  return lines
+}
+
 export async function statusText(relay: Relay, filter: (b: { discord: string; qq: string }) => boolean, all = true): Promise<string> {
   const lines: string[] = []
   const settings = relay.settings
@@ -91,6 +128,7 @@ export async function statusText(relay: Relay, filter: (b: { discord: string; qq
   for (const problem of settings.problems) lines.push(`⚠ ${problem}`)
   if (relay.pausedTr.has('global')) lines.push('⏸ 翻译全局暂停中')
   for (const problem of relay.translation.problems.slice(0, 10)) lines.push(`⚠ ${problem}`)
+  lines.push(...officialLines(relay, time), ...onlineSlangStatus(relay, time))
   if (settings.translate.enabled) {
     const t = relay.translation.translator.stats()
     const reasons = Object.entries(t.failures).map(([r, n]) => `${r} ${n}`).join('、')
@@ -216,16 +254,19 @@ export function registerCommands(ctx: Context, relay: Relay) {
     .option('translate', '-t 只恢复翻译')
     .action(pauseAction(false))
 
-  command('bridge.reload', '重新读取关键词文件和黑话表', { authority })
+  command('bridge.reload', '重新读取关键词文件和黑话表（在线词表马上下载一次）', { authority })
     .action(async ({ session }) => {
       if (!session) return
       try {
-        await relay.translation.reload()
+        // 在线词表（0.4.0）马上下载一次再读；下载失败的用手上的版本
+        await relay.translation.reload({ fetch: true })
         const glossary = relay.translation.glossary
         const problems = relay.translation.problems
+        const time = timeFormatter(relay.settings.timeZone)
         await reply(session, [
           `已重新读取。关键词 ${relay.translation.keywords?.size ?? 0} 条，术语 ${glossary?.size ?? 0} 条。`,
-          ...slangLine(relay.translation.slangFiles),
+          ...slangLine(relay.translation.slangFiles, time),
+          ...officialLines(relay, time),
           ...(problems.length ? ['问题：', ...problems.slice(0, 30).map((p) => `⚠ ${p}`)] : []),
         ].join('\n'))
       } catch (e) {
@@ -233,12 +274,24 @@ export function registerCommands(ctx: Context, relay: Relay) {
       }
     })
 
-  /** 每个黑话表文件的条数（T8），例如「黑话表：glossary.yaml 301 条，local-slang.yaml 2 条」；没配黑话表时不写这一行。 */
-  const slangLine = (files: typeof relay.translation.slangFiles) => {
+  /**
+   * 每个黑话表文件的条数（T8），例如「黑话表：glossary.yaml 301 条，local-slang.yaml 2 条」；没配黑话表时不写这一行。
+   * 在线黑话表（0.4.0）写「glossary.yaml（在线）301 条，更新于 …」；这次下载失败时写「读不到（原因），用的是 … 的缓存」。
+   */
+  const slangLine = (files: typeof relay.translation.slangFiles, time: (ms: number) => string) => {
     if (!files.length) return []
     const parts = files.map((f) => {
+      const replaced = f.replaced ? `（覆盖前面文件里的 ${f.replaced} 条）` : ''
+      if (f.online) {
+        const source = relay.translation.online.get('slang', f.path)
+        const name = `${f.name}（在线）`
+        if (!source) return `${name} 读不到`
+        if (source.error) return `${name}读不到（${source.error.reason}），${versionText(source, time)}${f.count === null ? '' : `，${f.count} 条${replaced}`}`
+        if (f.count === null) return `${name}读不到`
+        return `${name}${f.count} 条${replaced}，更新于 ${time(source.savedAt)}`
+      }
       if (f.count === null) return `${f.name} 读不到`
-      return `${f.name} ${f.count} 条${f.replaced ? `（覆盖前面文件里的 ${f.replaced} 条）` : ''}`
+      return `${f.name} ${f.count} 条${replaced}`
     })
     return [`黑话表：${parts.join('，')}`]
   }

@@ -70,6 +70,10 @@ export interface GlossarySettings {
   systemStyle: 'en(zh)' | 'en' | 'zh'
   slangFile: string
   overrides: Array<{ en: string; zh: string; mode: GlossaryMode; dir: GlossaryDir }>
+  /** 在线官方名称表的网址，`||` 分隔备用网址（0.4.0）；空 = 用插件自带的表 */
+  officialUrl: string
+  /** 在线词表每隔几小时检查一次（0.5–168），0 = 只在启动和 bridge.reload 时（0.4.0） */
+  refreshHours: number
 }
 
 export interface Settings {
@@ -104,6 +108,18 @@ function clampInt(value: unknown, fallback: number, min: number, max: number) {
   const n = typeof value === 'number' ? value : Number(value)
   if (!Number.isFinite(n)) return fallback
   return Math.min(max, Math.max(min, Math.round(n)))
+}
+
+/** 在线词表检查间隔的上限（小时）：一周。Node 的定时器最长约 596 小时，再大会变成每毫秒一次。 */
+const MAX_REFRESH_HOURS = 168
+
+/** 在线词表的检查间隔（小时）：0 = 不定时检查；其他值限制在 0.5–168 小时（一周）；写错时用 6。 */
+function refreshHours(value: unknown) {
+  if (value === undefined || value === null || value === '') return 6
+  const n = typeof value === 'number' ? value : Number(value)
+  if (!Number.isFinite(n) || n < 0) return 6
+  if (n === 0) return 0
+  return Math.min(MAX_REFRESH_HOURS, Math.max(0.5, n))
 }
 
 function text(value: unknown, fallback = '') {
@@ -221,6 +237,8 @@ export function normalizeSettings(config: Partial<Config>): Settings {
       systemStyle: ['en(zh)', 'en', 'zh'].includes(gl.systemStyle) ? gl.systemStyle : 'en(zh)',
       slangFile: text(gl.slangFile).trim(),
       overrides,
+      officialUrl: text(gl.officialUrl).trim(),
+      refreshHours: refreshHours(gl.refreshHours),
     },
     rows: [],
     bridges: [],
