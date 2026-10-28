@@ -158,14 +158,22 @@ const PLURAL = /^(?:es|s)(?![A-Za-z0-9])/
 /**
  * 还原被保护的内容。网址（U8）还原后不能和旁边的字粘在一起，否则 QQ 会把后面的字也算进链接：
  * 网址后面紧跟的不是空白或行尾，补一个空格（英文标点 `.,;:!?'")]>` 除外：保护时本来就不算进网址，原文里也是这样紧挨着的）；
- * 前面紧挨着汉字或全角标点，也补一个空格。其他占位符原样放回。
+ * 前面紧挨着汉字或全角标点，也补一个空格。
+ * 其他占位符（代号星系、ISK 数字、时间等）按 U3 的规则补空格（V1）：放回的内容以英文字母或数字开头、左边紧挨着英文字母或数字，
+ * 补一个空格（`tomorrow⟦0⟧` → `tomorrow R-A`）；以英文字母或数字结尾、右边紧挨着英文字母或数字也补，
+ * 右边紧跟复数词尾 s/es 并且后面是词边界时不补；括号、标点、汉字旁边不补。
  */
 export function restore(text: string, tokens: Array<{ token: string; value: string; url?: boolean }>): string {
   const map = new Map(tokens.map((t) => [t.token, t]))
   return text.replace(ANY_TOKEN, (m, offset: number) => {
     const t = map.get(m)
     if (!t) return m
-    if (!t.url) return t.value
+    if (!t.url) {
+      const end = offset + m.length
+      const before = ALNUM.test(t.value[0] ?? '') && ALNUM.test(text[offset - 1] ?? '') ? ' ' : ''
+      const after = ALNUM.test(t.value.at(-1) ?? '') && ALNUM.test(text[end] ?? '') && !PLURAL.test(text.slice(end)) ? ' ' : ''
+      return before + t.value + after
+    }
     const before = offset > 0 && CJK_EDGE.test(text[offset - 1]) ? ' ' : ''
     const next = text[offset + m.length]
     const after = next !== undefined && !/[\s.,;:!?'")\]>]/.test(next) ? ' ' : ''

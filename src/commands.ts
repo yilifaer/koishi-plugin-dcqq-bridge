@@ -118,10 +118,26 @@ function onlineSlangStatus(relay: Relay, time: (ms: number) => string): string[]
   return lines
 }
 
+/** 这个 QQ 群缓存的群友名字（V2，中译英时保护）：现在有几个、上次刷新的时间；还没取到或上次查询失败时说明。 */
+function memberNamesLine(relay: Relay, qq: string, time: (ms: number) => string): string {
+  const info = relay.translation.memberNameInfo(qq)
+  if (!info) return '群友名字：还没取到（插件启动后第一条中译英的消息才会去取）'
+  if (info.failed) return `群友名字：⚠ 最近一次查询失败，当作没有名片，稍后重试；上次成功刷新 ${time(info.okAt)}`
+  return `群友名字：缓存 ${info.count} 个，上次刷新 ${time(info.okAt)}`
+}
+
 export async function statusText(relay: Relay, filter: (b: { discord: string; qq: string }) => boolean, all = true): Promise<string> {
   const lines: string[] = []
   const settings = relay.settings
   const time = timeFormatter(settings.timeZone)
+  // QQ 没登录或和 LLBot 断开时，最上面先说一句（V9），已经发过提醒的也写明（V10）
+  const down = relay.watch.qq
+  if (down) {
+    const what = down.kind === 'loggedOut' ? 'QQ 机器人没有登录' : 'QQ 机器人和 LLBot 的连接断开了'
+    lines.push(`⚠ ${what}（从 ${time(down.since)} 起）${down.alerted ? '，已在 Discord 发出提醒' : ''}`)
+  }
+  const dcDown = relay.watch.discord
+  if (dcDown?.alerted) lines.push(`⚠ Discord 机器人掉线了（从 ${time(dcDown.since)} 起），已在 QQ 群发出提醒`)
   // 统计只在内存里，每次重载清零（A8）
   lines.push(`统计从 ${time(relay.stats.startedAt)} 重载后开始`)
   if (relay.paused.has('global')) lines.push('⏸ 全局暂停中')
@@ -163,10 +179,16 @@ export async function statusText(relay: Relay, filter: (b: { discord: string; qq
     const parts = [`${head} ${state}`, `最近转发 ${time(stats.lastForwardAt)}`, `24 小时 ${stats.forwards} 条 / 失败 ${stats.failures}`]
     lines.push(parts.join('，'))
     if (stats.lastFailure) lines.push(`   最近一次失败：${stats.lastFailure.reason}（${time(stats.lastFailure.at)}）`)
+    // QQ 掉线补发（V11）：打开了的桥显示待补发的条数
+    if (bridge.qqBackfill && bridge.direction !== 'q2d') {
+      const pending = await relay.store.pendingCount(bridge.key).catch(() => undefined)
+      lines.push(`   QQ 掉线补发：开，待补发 ${pending ?? '?'} 条（QQ 恢复后只补最近 ${settings.backfill.qqOfflineMinutes} 分钟的）`)
+    }
     if (bridge.translate && settings.translate.enabled) {
       const paused = relay.isTranslationPaused(bridge) ? '（翻译暂停中）' : ''
       const last = stats.lastTranslateFailure ? `，最近一次失败：${stats.lastTranslateFailure.reason}` : ''
       lines.push(`   翻译${paused}：24 小时 ${stats.translated} 条 / 失败 ${stats.translateFailures}${last}`)
+      if (all && bridge.direction !== 'd2q' && settings.translate.protectMemberNames) lines.push(`   ${memberNamesLine(relay, bridge.qq, time)}`)
     }
     for (const problem of relay.health.get(bridge.key) ?? []) lines.push(`   ${problem.startsWith('⚠') ? problem : `⚠ ${problem}`}`)
     for (const warning of row.warnings) lines.push(`   ⚠ ${warning}`)

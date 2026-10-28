@@ -6,7 +6,7 @@ import type {} from '@satorijs/adapter-discord'
 import { AtAllGate } from './atall'
 import { Bridge, bridgesFrom, normalizeSettings, Settings } from './bridges'
 import type { Config } from './config'
-import { DiscordSender, Webhook } from './discord/api'
+import { defaultSleep, DiscordSender, Webhook } from './discord/api'
 import { collectRefs, RawMessage, renderDiscordMessage } from './discord/render'
 import { describeError, internalErrorInfo } from './log'
 import { download } from './media'
@@ -14,7 +14,9 @@ import { buildDiscordContents, webhookUsername } from './out/discord'
 import { buildQQSends } from './out/qq'
 import { collectAtIds, parseQQMessage } from './qq/parse'
 import { qqOnline, sendQQ } from './qq/api'
-import { MessageRow, Store } from './store'
+import type { QQResult } from './qq/api'
+import { checkDelivered } from './qq/verify'
+import { MessageRow, PendingRow, Store } from './store'
 import { Stats } from './stats'
 import { TranslationOutcome, TranslationService } from './translate/service'
 import { MemberNames } from './translate/names'
@@ -22,6 +24,7 @@ import { commandWord, rootPrefixes } from './translate/skip'
 import { deletedReplyLine, prefixFor, replyLine, stripOwnDecorations } from './text/reply'
 import type { FileData, Msg } from './types'
 import { compareSnowflake, dateIn, Limiter, OrderedQueues, SeenSet, snowflakeFromTime, TtlCache } from './util'
+import { LinkWatch } from './watch'
 
 const HEAD_LIMIT = 60000
 const NAME_TTL = 10 * 60 * 1000
@@ -45,6 +48,10 @@ const MEMBER_SLOW_TTL = 60000
 const CHANNEL_TIMEOUT = 10000
 /** 频道信息查询超时或出错后，这么久之内不再查（F4）。 */
 const CHANNEL_FAIL_TTL = 60000
+/** 发 QQ 超时后，等这么久再去群里核对有没有发出去（V3）。 */
+const VERIFY_WAIT = 4000
+/** QQ 恢复后一次最多补发几条（V11）。 */
+const QQ_REPLAY_MAX = 200
 
 export interface RelayOptions {
   now?: () => number
@@ -123,7 +130,10 @@ export class Relay {
   private loadedDone = false
   private checkTimer: NodeJS.Timeout | null = null
   private dateOf: (ms: number) => string
-  private sleep?: RelayOptions['sleep']
+  /** 测试用：替换等待函数（也给提醒的发送用）。 */
+  sleep?: RelayOptions['sleep']
+  /** 两个机器人的连接状态、掉线提醒（V9、V10）。 */
+  watch: LinkWatch
 
   constructor(public ctx: Context, config: Config, private options: RelayOptions = {}) {
     this.logger = ctx.logger('dcqq-bridge')
@@ -137,6 +147,7 @@ export class Relay {
     this.dateOf = dateIn(this.settings.timeZone)
     this.gate = new AtAllGate(this.store, () => this.settings.atAll, this.dateOf, this.now)
     this.translation = new TranslationService(ctx, () => this.settings, this.logger, this.now)
+    this.watch = new LinkWatch(this)
     this.translation.memberNames = new MemberNames((group) => this.qqBot()?.internal?.getGroupMemberList(group), this.now)
     // 无效的行已经在 problems 里（F5），不再单独写一遍
     for (const problem of this.settings.problems) this.logger.warn(problem)
@@ -195,6 +206,7 @@ export class Relay {
       this.ctx.setInterval(() => void this.flushLastseen().catch(() => {}), 10000)
       this.ctx.setInterval(() => void this.heartbeat().catch(() => {}), ALIVE_INTERVAL)
       this.ctx.setInterval(() => void this.hourly().catch(() => {}), 3600000)
+      this.ctx.setInterval(() => void this.watchTick(), 60000)
     }
     await this.translation.reload().catch((e) => this.logger.warn('读取关键词、术语表出错：%s', describeError(e)))
     // 在线词表：上面已经用了缓存，这里才在后台下载（不等），之后定时检查（0.4.0）
@@ -211,7 +223,15 @@ export class Relay {
       }
     }
     this.scheduleSelfCheck()
+    if (this.options.timers !== false) void this.watchTick()
     await this.heartbeat().catch(() => {})
+  }
+
+  /** 每分钟的连接检查（V9、V10）；出错只记日志，不影响转发。 */
+  async watchTick() {
+    if (this.disposed) return
+    await this.loaded
+    await this.watch.tick().catch((e) => this.logger.warn('检查机器人连接出错：%s', describeError(e)))
   }
 
   /** 写 alive 心跳（和 lastseen 一起），READY 时用来判断插件停了多久。 */
@@ -291,6 +311,8 @@ export class Relay {
       const date = key.split(':')[2]
       if (date && date < cutoff) await this.store.delete(key)
     }
+    // QQ 一直不恢复时，待补发的记录也只留 keepDays 天（V11）
+    await this.store.prunePending(new Date(this.now() - this.settings.keepDays * 86400000))
   }
 
   // ---------------------------------------------------------------- 机器人
@@ -375,6 +397,7 @@ export class Relay {
     const outcome = await timed(prepared.translation, limit, null)
     if (!outcome) {
       this.stats.translation(bridge.key, false, '等待超时')
+      this.translation.logMissing(bridge.index, prepared.msg, { reason: '等待超时' })
       return undefined
     }
     if (outcome.ok) {
@@ -382,12 +405,13 @@ export class Relay {
       return `${this.settings.translate.label} ${outcome.text}`
     }
     if (!outcome.skipped) this.stats.translation(bridge.key, false, outcome.reason)
+    this.translation.logMissing(bridge.index, prepared.msg, outcome)
     return undefined
   }
 
-  private startTranslation(msg: Msg, bridges: Bridge[], blocked: Set<string>, direction: 'en2zh' | 'zh2en') {
-    // 补发的消息不翻译（B4）
-    if (msg.backfill || !this.settings.translate.enabled || !bridges.some((b) => !blocked.has(b.key) && b.translate)) return undefined
+  private startTranslation(msg: Msg, bridges: Bridge[], blocked: Set<string>, direction: 'en2zh' | 'zh2en', replay = false) {
+    // 网关断线补发的消息不翻译（B4）；QQ 掉线后补发的消息（replay）要翻译（V11）
+    if ((msg.backfill && !replay) || !this.settings.translate.enabled || !bridges.some((b) => !blocked.has(b.key) && b.translate)) return undefined
     // 暂停状态读完之后再判断（插件刚加载时 pausetr 还没读进来）
     return this.loaded.then(() => {
       if (!bridges.some((b) => !blocked.has(b.key) && this.needsTranslation(b))) return { ok: false, reason: '翻译暂停', skipped: true } as TranslationOutcome
@@ -548,13 +572,14 @@ export class Relay {
     return true
   }
 
-  private async prepareDiscord(d: RawMessage, backfill: boolean, bridges: Bridge[]): Promise<Prepared> {
+  /** replay：QQ 掉线后补发（V11）。「已经转发过」由补发流程按桥检查，这里不查；译文照常请求。 */
+  private async prepareDiscord(d: RawMessage, backfill: boolean, bridges: Bridge[], replay = false): Promise<Prepared> {
     const empty = (skip: string): Prepared => ({ msg: null, skip, images: [], videos: [], blocked: new Set() })
     // 回声兜底：别人的 webhook 集合里没有、但对应表里有（例如重启后）
     if (d.webhook_id && !this.sender.ownWebhooks.has(String(d.webhook_id))) {
       if ((await this.store.byTarget(d.channel_id, d.id)).length) return empty('自己发出的消息')
     }
-    if (backfill && await this.store.hasSource(d.channel_id, d.id)) return empty('已经转发过')
+    if (backfill && !replay && await this.store.hasSource(d.channel_id, d.id)) return empty('已经转发过')
     const bot = this.discordBot()
     const guildId = d.guild_id ?? this.guildOf.get(d.channel_id) ?? (await this.channel(bot, d.channel_id)).guildId
     const refs = collectRefs(d)
@@ -577,7 +602,7 @@ export class Relay {
       if (bridge.blockWords.some((re) => re.test(msg.checkText))) blocked.add(bridge.key)
     }
     if (blocked.size === bridges.length) return { msg, skip: '命中屏蔽词', images: [], videos: [], blocked }
-    const translation = this.startTranslation(msg, bridges, blocked, 'en2zh')
+    const translation = this.startTranslation(msg, bridges, blocked, 'en2zh', replay)
     const images: Prepared['images'] = []
     const videos: Prepared['videos'] = []
     await Promise.all(msg.media.map(async (media, i) => {
@@ -593,25 +618,30 @@ export class Relay {
     return { msg, images: images.filter(Boolean), videos: videos.filter(Boolean), blocked, translation }
   }
 
-  private async deliverToQQ(bridge: Bridge, preparing: Promise<Prepared>) {
-    if (this.disposed) return
+  /** 返回 true = 这条消息还在待补发列表里（V11：QQ 没登录，这次没发出去；或者插件正在停用）。 */
+  private async deliverToQQ(bridge: Bridge, preparing: Promise<Prepared>): Promise<boolean> {
+    if (this.disposed) return true
     const head = this.now()
     const deadline = head + HEAD_LIMIT
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), HEAD_LIMIT)
     try {
       const prepared = await Promise.race([preparing, sleepUntil(deadline, this.now).then(() => null)])
-      if (!prepared) return this.fail(bridge, 'd2q', '预处理超过 60 秒')
+      if (!prepared) {
+        this.fail(bridge, 'd2q', '预处理超过 60 秒')
+        return false
+      }
       const msg = prepared.msg
-      if (!msg || prepared.skip || prepared.blocked.has(bridge.key)) return
+      if (!msg || prepared.skip || prepared.blocked.has(bridge.key)) return false
       await this.loaded
-      if (this.isPaused(bridge) || this.disposed) return
+      if (this.isPaused(bridge)) return false
+      if (this.disposed) return true
       const bot = this.qqBot()
       // @全体（清单 §11）
       let atAll: Awaited<ReturnType<AtAllGate['decide']>> | null = null
       if (bridge.atAll && msg.mentionEveryone && bridge.direction !== 'q2d') {
         // 已经 dispose：不再做 @全体 决定（A1）
-        if (this.disposed) return
+        if (this.disposed) return true
         if (!bot || !qqOnline(bot)) atAll = { ok: false, reason: '查询失败' }
         else atAll = await this.gate.decide(bot, bridge.qq, msg, deadline)
         // 在发送之前就记下次数；已经超时或记不下来时改发文字
@@ -637,11 +667,12 @@ export class Relay {
         else line = this.replyText(msg, found.forwardedFrom)
       }
       const translated = await this.waitTranslation(bridge, prepared, deadline)
+      const prefix = prefixFor(bridge.label, msg.author, msg.backfill)
       const sends = buildQQSends({
         quoteId,
         atAll: !!atAll?.ok,
         fallbackText: atAll && !atAll.ok ? this.settings.atAll.fallbackText : undefined,
-        prefix: prefixFor(bridge.label, msg.author, msg.backfill),
+        prefix,
         replyLine: line,
         text: fullText(msg),
         translation: translated,
@@ -650,13 +681,18 @@ export class Relay {
       })
       if (!sends.length) {
         if (atAll?.ok) await atAll.revert().catch(() => {})
-        return
+        return false
       }
       let part = 0
       let failure = ''
+      /** 这条消息留在待补发列表里：QQ 发不出去，或者第一段还没发插件就停用了。 */
+      let keep = false
+      // 打开了掉线补发的桥：已经知道 QQ 掉线时不再等它连上，直接记进待补发列表（V11）
+      const sendOptions = { signal: controller.signal, deadline, sleep: this.sleep, noWait: () => bridge.qqBackfill && this.watch.qqDown }
       for (let i = 0; i < sends.length; i++) {
         if (this.disposed) {
           if (i === 0 && atAll?.ok) await atAll.revert().catch(() => {})
+          if (i === 0) keep = true
           break
         }
         if (this.now() >= deadline) {
@@ -664,16 +700,26 @@ export class Relay {
           failure = '超过 60 秒，后面的分段没有发出'
           break
         }
-        const result = await sendQQ(() => this.qqBot(), bridge.qq, sends[i], { signal: controller.signal, deadline, sleep: this.sleep })
-        if (i === 0 && atAll?.ok && !result.ok && !result.maybeSent) await atAll.revert().catch(() => {})
+        let result = await sendQQ(() => this.qqBot(), bridge.qq, sends[i], sendOptions)
+        // 超时：消息可能已经发出，先去群里核对，没发出才重发一次（V3）
+        if (!result.ok && result.timedOut) result = await this.recheckAfterTimeout(bridge, msg, sends[i], prefix.length, i, result, sendOptions)
+        // 明确没发出去：QQ 未连接，或者 LLBot 回复失败并且确认是因为 QQ 没登录（V11）
+        const notSent = !result.ok && (!result.maybeSent || (bridge.qqBackfill && await this.notLoggedIn(result)))
+        if (i === 0 && atAll?.ok && notSent) await atAll.revert().catch(() => {})
         if (result.ok) {
-          await this.record(msg, 'onebot', bridge.qq, result.messageId, part++)
+          if (result.messageId) await this.record(msg, 'onebot', bridge.qq, result.messageId, part)
+          part++
           continue
+        }
+        // 第一段就没发出去：记进待补发列表，不算转发失败（V11）
+        if (i === 0 && notSent && bridge.qqBackfill && await this.queuePending(bridge, msg, result.reason)) {
+          keep = true
+          break
         }
         // 视频发送失败：改发文字（这是另一条消息，不算重试）
         const video = this.videoOf(sends[i], prepared)
         if (video && result.reason !== 'QQ 未连接') {
-          const fallback = await sendQQ(() => this.qqBot(), bridge.qq, [h.text(video.placeholder)], { signal: controller.signal, deadline, sleep: this.sleep })
+          const fallback = await sendQQ(() => this.qqBot(), bridge.qq, [h.text(video.placeholder)], sendOptions)
           if (fallback.ok) {
             await this.record(msg, 'onebot', bridge.qq, fallback.messageId, part++)
             continue
@@ -684,9 +730,186 @@ export class Relay {
         if (!result.maybeSent && i === 0) break
       }
       this.count(bridge, part > 0, failure)
+      return keep
     } finally {
       clearTimeout(timer)
     }
+  }
+
+  /**
+   * 发 QQ 超时之后（0.4.1 V3）：消息可能已经发出（S21），所以先等几秒，去群里取最近 20 条看机器人有没有发过这一条。
+   * 已送达 → 当作成功；没有 → 在队首时限内重发一次；查询本身失败 → 不重发（宁可丢，不重复）。日志写明核对结果，不写消息内容。
+   */
+  private async recheckAfterTimeout(
+    bridge: Bridge, msg: Msg, elements: Element[], prefixLength: number, index: number,
+    failure: QQResult & { ok: false }, options: { signal: AbortSignal; deadline: number; sleep?: RelayOptions['sleep'] },
+  ): Promise<QQResult> {
+    const where = `第 ${bridge.index} 个桥 d2q 消息 ${msg.messageId} 第 ${index + 1} 段`
+    await (this.sleep ?? defaultSleep)(VERIFY_WAIT, options.signal).catch(() => {})
+    const bot = this.qqBot()
+    if (this.disposed || !bot || !qqOnline(bot)) {
+      this.logger.warn(`${where} 超时后核对：查询失败（QQ 已断开），不重发`)
+      return failure
+    }
+    const checked = await checkDelivered(bot, bridge.qq, elements, prefixLength)
+    if (checked.state === 'sent') {
+      this.logger.info(`${where} 超时后核对：已送达，不重发`)
+      return { ok: true, messageId: checked.messageId }
+    }
+    if (checked.state === 'unknown') {
+      this.logger.warn(`${where} 超时后核对：查询失败（${checked.reason}），不重发`)
+      return failure
+    }
+    if (this.now() >= options.deadline) {
+      this.logger.warn(`${where} 超时后核对：未送达，但已超过 60 秒发送期限，不重发`)
+      return failure
+    }
+    const again = await sendQQ(() => this.qqBot(), bridge.qq, elements, options)
+    if (again.ok) this.logger.info(`${where} 超时后核对：未送达，已重发`)
+    else this.logger.warn(`${where} 超时后核对：未送达，已重发但仍然失败：${again.reason}`)
+    return again
+  }
+
+  /** LLBot 回复了失败（有 retcode）时，确认是不是因为 QQ 没登录；没登录就肯定没发出去（V11）。 */
+  private async notLoggedIn(result: QQResult & { ok: false }) {
+    if (result.retcode === undefined) return false
+    return (await this.watch.refreshQQ()) === 'loggedOut'
+  }
+
+  // ---------------------------------------------------------------- QQ 掉线期间的补发（V11）
+
+  /** 记一条待补发的消息；记不下来返回 false（照普通失败处理）。 */
+  private async queuePending(bridge: Bridge, msg: Msg, reason: string): Promise<boolean> {
+    try {
+      const sentAt = Number.isFinite(msg.timestamp) && msg.timestamp > 0 ? msg.timestamp : this.now()
+      await this.store.addPending(bridge.key, msg.channelId, msg.messageId, new Date(sentAt))
+      this.logger.info(`第 ${bridge.index} 个桥 d2q 消息 ${msg.messageId}：QQ 现在发不出去（${reason}），已记入待补发，QQ 恢复后补发`)
+      return true
+    } catch (e) {
+      this.logger.warn('记录待补发消息失败：%s', describeError(e))
+      return false
+    }
+  }
+
+  /** QQ 机器人恢复了：马上补发掉线期间记下来的消息，并重新做一次健康检查。 */
+  onQQRecovered() {
+    this.scheduleSelfCheck()
+    void this.replayPending()
+  }
+
+  private replayJob: Promise<void> | null = null
+
+  /**
+   * 补发 QQ 掉线期间记下来的消息（V11）：按原来的顺序，只补最近 backfill.qqOfflineMinutes 分钟的，更早的只写一行日志。
+   * 内容向 Discord 重新取（消息已删除就不补），前缀带「（补发）」，不 @全体，译文照常请求。同时只跑一次。
+   */
+  replayPending(): Promise<void> {
+    return this.replayJob ??= this.doReplay()
+      .catch((e) => void this.logger.warn('补发 QQ 掉线期间的消息出错：%s', describeError(e)))
+      .finally(() => (this.replayJob = null))
+  }
+
+  private async doReplay() {
+    await this.loaded
+    const qq = this.qqBot()
+    if (this.disposed || this.watch.qqDown || !qq || !qqOnline(qq)) return
+    // 没有桥打开掉线补发（默认）：不用查数据库，每分钟的检查不增加负担
+    if (!this.settings.bridges.some((b) => b.qqBackfill)) return
+    const all = await this.store.pending()
+    if (!all.length) return
+    // 原来的顺序：先按发出的时间，同一时刻按消息 ID
+    all.sort((a, b) => a.sentAt.getTime() - b.sentAt.getTime() || compareSnowflake(a.message, b.message))
+    const minutes = this.settings.backfill.qqOfflineMinutes
+    const now = this.now()
+    const groups = new Map<string, { channel: string; message: string; rows: Array<{ row: PendingRow; bridge: Bridge }> }>()
+    let expired = 0
+    for (const row of all) {
+      const bridge = this.settings.bridges.find((b) => b.key === row.bridge)
+      // 桥已经删了、停用了或者关掉了补发：这条不补
+      if (!bridge || !bridge.qqBackfill || bridge.direction === 'q2d') {
+        await this.store.removePending(row.key)
+        continue
+      }
+      if (now - row.sentAt.getTime() > minutes * 60000) {
+        await this.store.removePending(row.key)
+        expired++
+        continue
+      }
+      const id = `${row.channel}:${row.message}`
+      let group = groups.get(id)
+      if (!group) groups.set(id, group = { channel: row.channel, message: row.message, rows: [] })
+      group.rows.push({ row, bridge })
+    }
+    if (expired) this.logger.warn(`QQ 掉线期间有 ${expired} 条超过 ${minutes} 分钟，没有补发`)
+    if (!groups.size) return
+    const discord = this.discordBot()
+    // Discord 暂时不可用：留着，下一分钟再试
+    if (!discord) return
+    const jobs: Array<Promise<void>> = []
+    let count = 0
+    /** QQ 又发不出去、留在待补发列表里的条数。 */
+    let kept = 0
+    for (const group of groups.values()) {
+      if (this.disposed) break
+      if (count >= QQ_REPLAY_MAX) {
+        this.logger.warn(`待补发的消息超过 ${QQ_REPLAY_MAX} 条，这次先补发最早的 ${QQ_REPLAY_MAX} 条，其余的下一分钟继续`)
+        break
+      }
+      let raw: RawMessage
+      try {
+        raw = await discord.internal.getChannelMessage(group.channel, group.message)
+      } catch (e) {
+        const info = internalErrorInfo(e)
+        if (info.status === 404 || info.code === 10008) {
+          // 消息已经被删了
+          this.logger.debug(`待补发的消息 ${group.message} 在 Discord 上已经不存在，不补发`)
+          for (const { row } of group.rows) await this.store.removePending(row.key)
+          continue
+        }
+        // Discord 暂时取不到：这一条和后面的都留着（保持顺序），下一分钟再试
+        this.logger.warn('补发时向 Discord 取消息失败：%s', describeError(e))
+        break
+      }
+      // 已经发到过这个群的不重复发（例如上一次补发到一半插件重启了）
+      const targets: Array<{ row: PendingRow; bridge: Bridge }> = []
+      for (const target of group.rows) {
+        if (await this.store.hasSource(group.channel, group.message, target.bridge.qq)) await this.store.removePending(target.row.key)
+        else targets.push(target)
+      }
+      if (!targets.length) continue
+      count++
+      const d = { ...raw, channel_id: raw.channel_id ?? group.channel }
+      const bridges = targets.map((t) => t.bridge)
+      // 在第一个 await 之前占好位置，保证补发的先后顺序
+      const slots = targets.map((target) => ({ ...target, slot: this.queues.reserve(`onebot:${target.bridge.qq}`) }))
+      const queuedAt = this.now()
+      const prepared = this.limiters.d2q.run(() => this.prepareDiscord(d, true, bridges, true)).catch((e): Prepared => {
+        this.logger.warn('处理待补发的 Discord 消息 %s 出错：%s', d.id, describeError(e))
+        return { msg: null, skip: '预处理出错', images: [], videos: [], blocked: new Set() }
+      })
+      const release = this.releaseAfter(prepared, slots.length)
+      for (const { row, bridge, slot } of slots) {
+        jobs.push(slot.turn
+          // 插件已经停了（重载 / 卸载）：没发的行留在库里，由新实例接着补发，不能当成已处理删掉
+          .then(() => this.disposed ? true : this.tooOld(bridge, 'd2q', queuedAt, d.id) ? false : this.deliverToQQ(bridge, prepared))
+          // QQ 又掉线了会再次记进待补发列表（keep = true），其他情况这条就处理完了
+          .then((keep) => {
+            if (!keep) return this.store.removePending(row.key)
+            kept++
+          })
+          .catch((e) => {
+            this.logger.warn('补发到 QQ 群 %s 出错：%s', bridge.qq, describeError(e))
+            if (this.disposed) return
+            return this.store.removePending(row.key).catch(() => {})
+          })
+          .finally(() => {
+            slot.done()
+            release()
+          }))
+      }
+    }
+    await Promise.all(jobs)
+    if (jobs.length) this.logger.info(`QQ 掉线期间的消息：处理了 ${jobs.length} 条${kept ? `，其中 ${kept} 条因为 QQ 又发不出去，留到下次恢复后补发` : ''}`)
   }
 
   private videoOf(send: Element[], prepared: Prepared) {
@@ -1110,7 +1333,10 @@ export class Relay {
   async selfCheck() {
     const discord = this.discordBot()
     const qq = this.qqBot()
-    if (!discord || !qq || !qqOnline(qq)) return
+    // 先问一次 QQ 有没有登录（V9）：没登录（或 OneBot 断开）时所有 QQ 接口都会失败，
+    // 这里整个跳过；掉线本身由 watch 写一行日志，不再每座桥每次都写警告
+    const link = await this.watch.refreshQQ()
+    if (!discord || !qq || link !== 'ok') return
     // 同一个频道、同一个群每次自检只查一次（A8）：多个桥指向同一个群时共用结果。返回问题，没问题返回 null
     const once = new Map<string, Promise<string | null>>()
     const check = (key: string, fn: () => Promise<string | null>) => {
@@ -1158,11 +1384,14 @@ export class Relay {
         }))
       }
       const found = problems.filter((p): p is string => !!p)
+      const before = this.health.get(bridge.key)
+      // 同一个问题只在状态变化时写日志：第一次出现、内容变了、恢复了（V9）
       if (found.length) {
         this.health.set(bridge.key, found)
-        this.logger.warn(`第 ${bridge.index} 个桥：${found.join('；')}`)
+        if (!before || before.join('\n') !== found.join('\n')) this.logger.warn(`第 ${bridge.index} 个桥：${found.join('；')}`)
       } else {
         this.health.delete(bridge.key)
+        if (before) this.logger.info(`第 ${bridge.index} 个桥：之前的问题已恢复`)
       }
     }
   }

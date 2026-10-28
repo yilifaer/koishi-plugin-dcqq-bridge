@@ -214,7 +214,8 @@ describe('A2 补发触发', () => {
     e.discord.history.set(DC_CHANNEL, [discordPayload({ id: snowflakeAt(t - 1800000, 1), content: '重载期间' })])
     e.dcBot.status = Universal.Status.ONLINE
     const { relay } = await installRelay(e, baseConfig())
-    expect(await relay.store.get(`lastseen:${DC_CHANNEL}`)).toBe(latest)
+    // 不假设 start() 返回时 lastseen 已经写好：轮询等到为止，负载高时不会误判
+    await waitFor(async () => (await relay.store.get<string>(`lastseen:${DC_CHANNEL}`)) === latest, 15000)
     await sleep(200)
     expect(historyGets(e)).toHaveLength(0)
     expect(e.qq.sent).toHaveLength(0)

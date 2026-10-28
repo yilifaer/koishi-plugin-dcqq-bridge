@@ -3,7 +3,7 @@
 
 import http from 'node:http'
 import type { AddressInfo } from 'node:net'
-import { Context } from 'koishi'
+import { Context, Universal } from 'koishi'
 import HTTP from '@koishijs/plugin-http'
 import Memory from '@koishijs/plugin-database-memory'
 import { DiscordBot } from '@satorijs/adapter-discord'
@@ -48,6 +48,8 @@ export class FakeDiscord {
   history = new Map<string, any[]>()
   /** 路径正则 → 依次使用的故障。 */
   faults: Array<{ method: string; pattern: RegExp; fault: Fault; times: number }> = []
+  /** 私信频道：用户 ID → 频道 ID（POST /users/@me/channels 创建）。 */
+  dms = new Map<string, string>()
   /** 在返回之前调用（测试可以在这里模拟「网关回声先到」）。 */
   beforeRespond: ((req: DiscordRequest, id: string) => Promise<void> | void) | null = null
   private nextId = 950000000000000000n
@@ -127,6 +129,16 @@ export class FakeDiscord {
       this.webhooks.set(m[1], [...(this.webhooks.get(m[1]) ?? []), wh])
       return send(200, wh)
     }
+    // 0.4.1：补发时按 ID 取单条消息、掉线提醒创建私信频道
+    if (request.method === 'GET' && (m = /^\/channels\/(\d+)\/messages\/(\d+)$/.exec(path))) {
+      const hit = (this.history.get(m[1]) ?? []).find((x) => x.id === m![2])
+      return hit ? send(200, hit) : send(404, { message: 'Unknown Message', code: 10008 })
+    }
+    if (request.method === 'POST' && path === '/users/@me/channels') {
+      const user = String(request.json?.recipient_id ?? '')
+      if (!this.dms.has(user)) this.dms.set(user, this.newId())
+      return send(200, { id: this.dms.get(user), type: 1, recipients: [{ id: user }] })
+    }
     if (request.method === 'GET' && (m = /^\/channels\/(\d+)\/messages$/.exec(path))) {
       const after = url.searchParams.get('after') ?? '0'
       const limit = Number(url.searchParams.get('limit') ?? 50)
@@ -165,7 +177,23 @@ export class FakeQQ {
   messages = new Map<string, any>()
   /** 带视频段的发送一律失败（LLBot 下载视频失败时的样子）。 */
   failVideo = false
+  /**
+   * LLBot 没登录 QQ（0.4.1）：get_status 返回 online: false，其他所有接口都返回 retcode 1200，和 2026-10-26 那次掉线一样。
+   */
+  loggedIn = true
+  /** 只生效一次的故障，按顺序用掉：动作 → 'timeout' | 'fail'。 */
+  onceFaults: Array<{ action: string; kind: 'timeout' | 'fail' }> = []
+  /** 超时的那次发送其实已经发出去了（LLBot 发出后回复慢了）。 */
+  deliverOnTimeout = false
+  /** 每个请求处理之前调用（测试可以在这里改 loggedIn，模拟请求进行到一半时掉线）。 */
+  beforeHandle: ((action: string) => void) | null = null
+  /** 模拟超时之前调用（测试可以在这里拨快时钟）。 */
+  onTimeout: (() => void) | null = null
   private messageId = 7000
+
+  faultOnce(action: string, kind: 'timeout' | 'fail') {
+    this.onceFaults.push({ action, kind })
+  }
 
   text(group = QQ_GROUP) {
     return this.sent.filter((s) => s.group === group).map((s) => s.text)
@@ -173,11 +201,32 @@ export class FakeQQ {
 
   handle(action: string, params: any): any {
     this.calls.push({ action, params: JSON.parse(JSON.stringify(params ?? {})) })
-    const fault = this.faults.get(action)
-    if (fault === 'timeout') throw new OneBot.TimeoutError(params, action)
-    if (fault === 'fail') return { status: 'failed', retcode: 1200, data: null }
     const ok = (data: any = null) => ({ status: 'ok', retcode: 0, data })
+    this.beforeHandle?.(action)
+    if (action === 'get_status' && !this.loggedIn) return ok({ online: false, good: true })
+    if (!this.loggedIn) return { status: 'failed', retcode: 1200, data: null }
+    const onceAt = this.onceFaults.findIndex((f) => f.action === action)
+    const once = onceAt >= 0 ? this.onceFaults.splice(onceAt, 1)[0].kind : undefined
+    const fault = once ?? this.faults.get(action)
+    if (fault === 'timeout') {
+      if (this.deliverOnTimeout && action === 'send_group_msg') this.record(params)
+      this.onTimeout?.()
+      throw new OneBot.TimeoutError(params, action)
+    }
+    if (fault === 'fail') return { status: 'failed', retcode: 1200, data: null }
     switch (action) {
+      case 'get_status':
+        return ok({ online: true, good: true })
+      case 'get_group_msg_history': {
+        // 最近 count（默认 20）条，从旧到新，只有机器人自己发过的
+        const own = this.sent.filter((s) => s.group === String(params.group_id))
+        return ok({
+          messages: own.slice(-(params.count ?? 20)).map((s) => ({
+            message_id: +s.id, message_seq: +s.id, time: Math.floor(Date.now() / 1000),
+            sender: { user_id: +QQ_BOT, nickname: 'bot' }, message: s.segments, raw_message: s.text,
+          })),
+        })
+      }
       case 'get_login_info':
         return ok({ user_id: +QQ_BOT, nickname: 'bot' })
       case 'get_group_info':
@@ -203,13 +252,18 @@ export class FakeQQ {
         if (this.failVideo && Array.isArray(params.message) && params.message.some((seg: any) => seg.type === 'video')) {
           return { status: 'failed', retcode: 1200, data: null }
         }
-        const id = String(++this.messageId)
-        const segments = params.message
-        this.sent.push({ group: String(params.group_id), segments, text: flatten(segments), id })
-        return ok({ message_id: +id })
+        return ok({ message_id: +this.record(params) })
       }
     }
     return ok()
+  }
+
+  /** 记下一次发出去的群消息，返回消息 ID。 */
+  private record(params: any) {
+    const id = String(++this.messageId)
+    const segments = params.message
+    this.sent.push({ group: String(params.group_id), segments, text: flatten(segments), id })
+    return id
   }
 }
 
@@ -354,6 +408,9 @@ export async function setup(patch: Partial<Config> = {}, options: {
     },
   })
   await app.start()
+  // 网关地址无效：真实的 DiscordBot 会异步地从「连接中」变成「离线」。等它定下来再往下走，
+  // 否则测试里手动把状态改成在线之后，会被这次迟到的变化改回去（负载高时才会撞上）
+  for (let i = 0; i < 500 && dcBot.status === Universal.Status.CONNECT; i++) await new Promise((r) => setTimeout(r, 10))
   qqBot.online()
   if (options.online !== false) {
     dcBot.user = { id: DC_BOT, name: 'bridge-bot' }

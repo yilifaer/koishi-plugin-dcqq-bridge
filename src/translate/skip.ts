@@ -3,8 +3,11 @@
 const HAN = /\p{Script=Han}/gu
 // 汉字以外的字母（拉丁字母等）
 const LETTER = /(?!\p{Script=Han})\p{L}/gu
-// 「字」：一个汉字算一个，一串连续的其他字母算一个
-const WORD = /\p{Script=Han}|(?:(?!\p{Script=Han})\p{L})+(?:['’](?:(?!\p{Script=Han})\p{L})+)*/gu
+// 「字」：一个汉字算一个，一串连续的其他字母算一个；
+// 紧挨着汉字或字母（中间没有空格）的一串数字也算一个（V7：「2个」「18年」「9000dph」），单独的数字不算
+const WORD = /\p{Script=Han}|(?:(?!\p{Script=Han})\p{L})+(?:['’](?:(?!\p{Script=Han})\p{L})+)*|\p{Nd}+(?=\p{L})|(?<=\p{L})\p{Nd}+/gu
+// 紧挨着汉字的数字串（V7）：中译英判断「是不是中文」时当作中文的一部分，免得「2个」只有 1 个汉字被判成不是中文
+const HAN_NUMBER = /\p{Nd}+(?=\p{Script=Han})|(?<=\p{Script=Han})\p{Nd}+/gu
 
 /** 返回跳过的原因，要翻译时返回 null。 */
 export function skipReason(stripped: string, direction: 'en2zh' | 'zh2en'): string | null {
@@ -13,7 +16,7 @@ export function skipReason(stripped: string, direction: 'en2zh' | 'zh2en'): stri
   if (!han && !letters) return '没有文字'
   if ((stripped.match(WORD)?.length ?? 0) < 2) return '太短'
   if (direction === 'en2zh' && han / (han + letters) >= 0.3) return '已是中文'
-  if (direction === 'zh2en' && han < 2) return '不是中文'
+  if (direction === 'zh2en' && han + (stripped.match(HAN_NUMBER)?.length ?? 0) < 2) return '不是中文'
   return null
 }
 

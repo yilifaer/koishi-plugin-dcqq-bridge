@@ -38,11 +38,24 @@ export interface GlossaryRow {
   createdAt: Date
 }
 
+/** QQ 掉线期间没发出去、等恢复后补发的 Discord 消息（0.4.1 V11）。只存位置，补发时再向 Discord 取内容。 */
+export interface PendingRow {
+  /** `桥 key:Discord 消息 ID`；同一条消息同一座桥只有一行。 */
+  key: string
+  /** 桥的 key（`<discord>:<qq>`）。 */
+  bridge: string
+  channel: string
+  message: string
+  /** Discord 消息发出的时间（判断是否超过补发时限）。 */
+  sentAt: Date
+}
+
 declare module 'koishi' {
   interface Tables {
     dcqqbridge_message: MessageRow
     dcqqbridge_state: StateRow
     dcqqbridge_glossary: GlossaryRow
+    dcqqbridge_pending: PendingRow
   }
 }
 
@@ -75,6 +88,13 @@ export function extendModels(ctx: Context) {
     createdBy: 'string(128)',
     createdAt: 'timestamp',
   }, { primary: 'key' })
+  ctx.model.extend('dcqqbridge_pending', {
+    key: 'string(160)',
+    bridge: 'string(140)',
+    channel: 'string(64)',
+    message: 'string(64)',
+    sentAt: 'timestamp',
+  }, { primary: 'key' })
 }
 
 export class Store {
@@ -105,6 +125,32 @@ export class Store {
 
   async cleanup(keepDays: number, now = Date.now()) {
     const result = await this.db.remove('dcqqbridge_message', { time: { $lt: new Date(now - keepDays * 86400000) } })
+    return (result as any)?.removed ?? 0
+  }
+
+  // ---------------------------------------------------------------- QQ 掉线待补发（V11）
+
+  /** 记一条待补发的消息；同一座桥同一条消息再记一次只是覆盖。 */
+  async addPending(bridge: string, channel: string, message: string, sentAt: Date) {
+    await this.db.upsert('dcqqbridge_pending', [{ key: `${bridge}:${message}`, bridge, channel, message, sentAt }])
+  }
+
+  async pending(): Promise<PendingRow[]> {
+    return this.db.get('dcqqbridge_pending', {})
+  }
+
+  /** 某座桥现在有几条待补发（给 bridge.status）。 */
+  async pendingCount(bridge: string) {
+    return (await this.db.get('dcqqbridge_pending', { bridge }, ['key'])).length
+  }
+
+  async removePending(key: string) {
+    await this.db.remove('dcqqbridge_pending', { key })
+  }
+
+  /** 清掉发出时间早于 before 的行（长期不恢复时不让表越长越大）。 */
+  async prunePending(before: Date) {
+    const result = await this.db.remove('dcqqbridge_pending', { sentAt: { $lt: before } })
     return (result as any)?.removed ?? 0
   }
 

@@ -30,7 +30,7 @@ describe('Config schema', () => {
     expect(bridges.type).toBe('array')
     expect(bridges.meta.role).toBe('table')
     expect(bridges.inner.type).toBe('object')
-    expect(Object.keys(bridges.inner.dict)).toEqual(['label', 'discord', 'qq', 'direction', 'enabled', 'atAll', 'blockWords', 'translate'])
+    expect(Object.keys(bridges.inner.dict)).toEqual(['label', 'discord', 'qq', 'direction', 'enabled', 'atAll', 'blockWords', 'translate', 'qqBackfill'])
   })
 
   it('a bad row only invalidates itself (A6)', () => {

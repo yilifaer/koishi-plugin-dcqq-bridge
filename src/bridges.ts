@@ -15,6 +15,8 @@ export interface Bridge {
   atAll: boolean
   /** 这个桥打开了翻译（还要看总开关）。 */
   translate: boolean
+  /** QQ 掉线时 Discord → QQ 的消息先记下来，恢复后补发（0.4.1 V11）。 */
+  qqBackfill: boolean
   /** 编译好的屏蔽词。 */
   blockWords: RegExp[]
   /** 桥的唯一标识：`<discord>:<qq>`。 */
@@ -55,6 +57,8 @@ export interface TranslateSettings {
   context: string
   /** 中译英时保护 QQ 群成员名片里的名字（U7），默认开。 */
   protectMemberNames: boolean
+  /** 永远不当作名字的词（V2，去首尾空白）；空 = 没有。 */
+  memberNameIgnore: string[]
 }
 
 export interface FilterSettings {
@@ -63,6 +67,12 @@ export interface FilterSettings {
   moderation: boolean
   moderationBaseURL: string
   moderationApiKey: string
+  /** 审核忽略的类别（V4，小写，按前缀匹配）；空 = 任何类别被标记都算。 */
+  moderationIgnore: string[]
+  /** 各类别需要达到的最低分数（V4，类别名小写、完全相同）。 */
+  moderationMinScore: Record<string, number>
+  /** 审核管哪个方向（V5）。 */
+  moderationDirections: 'both' | 'en2zh' | 'zh2en'
 }
 
 export interface GlossarySettings {
@@ -74,6 +84,20 @@ export interface GlossarySettings {
   officialUrl: string
   /** 在线词表每隔几小时检查一次（0.5–168），0 = 只在启动和 bridge.reload 时（0.4.0） */
   refreshHours: number
+}
+
+/** 掉线提醒（0.4.1 V10）：ID 写错的那一项置空，不影响别的。 */
+export interface AlertSettings {
+  discordChannel: string
+  discordUser: string
+  /** 掉线超过几分钟才提醒（0–10080）。 */
+  afterMinutes: number
+  qqGroup: string
+}
+
+export interface BackfillSettings {
+  /** QQ 掉线补发只补最近几分钟的消息（1–10080）。 */
+  qqOfflineMinutes: number
 }
 
 export interface Settings {
@@ -90,6 +114,8 @@ export interface Settings {
   translate: TranslateSettings
   filter: FilterSettings
   glossary: GlossarySettings
+  alert: AlertSettings
+  backfill: BackfillSettings
   rows: RowStatus[]
   bridges: Bridge[]
   /** 全局问题（例如时区写错）。 */
@@ -142,6 +168,36 @@ export function compileBlockWords(source: string): { patterns: RegExp[]; errors:
   return { patterns, errors }
 }
 
+/** `;;` 分隔的词：去首尾空白、去掉空项和重复项（保持顺序）。 */
+function splitWords(source: string, lower = false) {
+  return [...new Set(source.split(';;').map((w) => (lower ? w.trim().toLowerCase() : w.trim())).filter(Boolean))]
+}
+
+/** filter.moderationMinScore：`类别=分数;;类别=分数`，分数 0–1；写错的项跳过并提示，不影响别的项（V4）。 */
+function parseMinScores(source: string, problems: string[]): Record<string, number> {
+  const out: Record<string, number> = {}
+  for (const entry of splitWords(source)) {
+    const i = entry.indexOf('=')
+    const category = entry.slice(0, i).trim().toLowerCase()
+    const raw = entry.slice(i + 1).trim()
+    const score = raw === '' ? NaN : Number(raw)
+    if (i < 0 || !category || !Number.isFinite(score) || score < 0 || score > 1) {
+      problems.push(`审核的最低分数「${entry}」写错了（要写成 类别=0 到 1 之间的分数，例如 harassment=0.5），已忽略这一项`)
+      continue
+    }
+    out[category] = score
+  }
+  return out
+}
+
+/** filter.moderationDirections：both / en2zh / zh2en，没填是 both；写错时按 both 并提示（V5）。 */
+function moderationDirections(value: unknown, problems: string[]): 'both' | 'en2zh' | 'zh2en' {
+  if (value === undefined || value === null || value === '') return 'both'
+  if (value === 'both' || value === 'en2zh' || value === 'zh2en') return value
+  problems.push(`审核方向「${text(value)}」不对（要写 both、en2zh 或 zh2en），按两个方向都审核处理`)
+  return 'both'
+}
+
 /** translate.extraBody：必须是 JSON 对象；写错时提示并忽略（B7）。不把内容写进提示（可能带 key）。 */
 function parseExtraBody(source: string, problems: string[]): Record<string, unknown> {
   if (!source.trim()) return {}
@@ -161,6 +217,15 @@ function parseExtraBody(source: string, problems: string[]): Record<string, unkn
   return out
 }
 
+/** 提醒目标的 ID：必须是纯数字，写错时提示并忽略这一项（V10）。 */
+function numericId(value: unknown, name: string, problems: string[]) {
+  const id = text(value).trim()
+  if (!id) return ''
+  if (/^\d+$/.test(id)) return id
+  problems.push(`${name} 必须是纯数字，已忽略`)
+  return ''
+}
+
 export function normalizeSettings(config: Partial<Config>): Settings {
   const problems: string[] = []
   let timeZone = isValidTimeZone(text(config.timezone, 'Asia/Shanghai').trim() || 'Asia/Shanghai')
@@ -172,6 +237,8 @@ export function normalizeSettings(config: Partial<Config>): Settings {
   const tr: any = config.translate && typeof config.translate === 'object' ? config.translate : {}
   const fl: any = config.filter && typeof config.filter === 'object' ? config.filter : {}
   const gl: any = config.glossary && typeof config.glossary === 'object' ? config.glossary : {}
+  const al: any = config.alert && typeof config.alert === 'object' ? config.alert : {}
+  const bf: any = config.backfill && typeof config.backfill === 'object' ? config.backfill : {}
   // 标注去掉空白和零宽字符后为空，就用【机翻】（清单 §4.4）
   let label = text(tr.label, '【机翻】').trim()
   if (!label.replace(/[\s\p{Cf}\u034f\u115f\u1160\u3164\uffa0]/gu, '')) {
@@ -191,6 +258,7 @@ export function normalizeSettings(config: Partial<Config>): Settings {
     keepValueLabels: [...new Set(text(tr.keepValueLabels).split(';;').map(normalizeLabel).filter(Boolean))],
     context: text(tr.context).trim(),
     protectMemberNames: tr.protectMemberNames !== false,
+    memberNameIgnore: splitWords(text(tr.memberNameIgnore)),
   }
   if (translate.enabled && (!translate.baseURL || !translate.model)) {
     problems.push('翻译已打开，但没有填接口地址或模型，按关闭处理')
@@ -231,6 +299,9 @@ export function normalizeSettings(config: Partial<Config>): Settings {
       moderation: fl.moderation === true,
       moderationBaseURL: (text(fl.moderationBaseURL).trim() || 'https://api.openai.com/v1').replace(/\/+$/, ''),
       moderationApiKey: text(fl.moderationApiKey).trim(),
+      moderationIgnore: splitWords(text(fl.moderationIgnore), true),
+      moderationMinScore: parseMinScores(text(fl.moderationMinScore), problems),
+      moderationDirections: moderationDirections(fl.moderationDirections, problems),
     },
     glossary: {
       eve: gl.eve === true,
@@ -239,6 +310,15 @@ export function normalizeSettings(config: Partial<Config>): Settings {
       overrides,
       officialUrl: text(gl.officialUrl).trim(),
       refreshHours: refreshHours(gl.refreshHours),
+    },
+    alert: {
+      discordChannel: numericId(al.discordChannel, '掉线提醒的 discordChannel（Discord 频道 ID）', problems),
+      discordUser: numericId(al.discordUser, '掉线提醒的 discordUser（Discord 用户 ID）', problems),
+      afterMinutes: clampInt(al.afterMinutes, 10, 0, 10080),
+      qqGroup: numericId(al.qqGroup, '掉线提醒的 qqGroup（QQ 群号）', problems),
+    },
+    backfill: {
+      qqOfflineMinutes: clampInt(bf.qqOfflineMinutes, 30, 1, 10080),
     },
     rows: [],
     bridges: [],
@@ -303,6 +383,7 @@ export function normalizeSettings(config: Partial<Config>): Settings {
       direction: status.direction,
       atAll: row.atAll === true,
       translate: row.translate === true,
+      qqBackfill: row.qqBackfill === true,
       blockWords: patterns,
       key,
     }

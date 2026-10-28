@@ -16,11 +16,13 @@ export interface BridgeRow {
   atAll: boolean
   blockWords: string
   translate: boolean
+  // 可选：0.4.1 新增，旧的测试配置里没有这个字段，运行时按关闭处理
+  qqBackfill?: boolean
 }
 
 /** 桥的一行写错时回退到的哨兵：带这个键的行在运行时标成无效（A6）。 */
 export const INVALID_ROW_KEY = '__invalidRow'
-const INVALID_ROW = { [INVALID_ROW_KEY]: true } as unknown as BridgeRow
+const INVALID_ROW = { [INVALID_ROW_KEY]: true } as unknown as Required<BridgeRow>
 
 export interface AtAllConfig {
   fallbackText: string
@@ -51,6 +53,9 @@ export interface TranslateConfig {
   context: string
   /** 中译英时保护 QQ 群成员名片里的名字（U7）。 */
   protectMemberNames: boolean
+  // 可选：0.4.1 新增，旧的测试配置里没有这个字段，运行时按空处理
+  /** 永远不当作名字的词，;; 分隔（V2）。 */
+  memberNameIgnore?: string
 }
 
 export interface FilterConfig {
@@ -59,6 +64,13 @@ export interface FilterConfig {
   moderation: boolean
   moderationBaseURL: string
   moderationApiKey: string
+  // 可选：0.4.1 新增，旧的测试配置里没有这几个字段，运行时按默认值处理
+  /** 审核忽略的类别，;; 分隔，按前缀匹配（V4）。 */
+  moderationIgnore?: string
+  /** 各类别需要达到的最低分数，`类别=分数`，;; 分隔（V4）。 */
+  moderationMinScore?: string
+  /** 审核管哪个方向（V5）：both、en2zh、zh2en。 */
+  moderationDirections?: 'both' | 'en2zh' | 'zh2en'
 }
 
 export interface GlossaryConfig {
@@ -69,6 +81,24 @@ export interface GlossaryConfig {
   // 可选：0.4.0 新增，旧的测试配置里没有这两个字段，运行时按空和 6 处理
   officialUrl?: string
   refreshHours?: number
+}
+
+/** 掉线提醒（0.4.1 V10）：全部默认空，空 = 不提醒。 */
+export interface AlertConfig {
+  /** 提醒发到哪个 Discord 频道（频道 ID）。 */
+  discordChannel: string
+  /** 提醒私信给哪个 Discord 用户（用户 ID）。 */
+  discordUser: string
+  /** 掉线超过几分钟才提醒。 */
+  afterMinutes: number
+  /** Discord 断开时，在哪个 QQ 群里提醒（群号）。 */
+  qqGroup: string
+}
+
+/** 补发（0.4.1 V11）：QQ 掉线期间 Discord → QQ 的消息，恢复后补发。 */
+export interface BackfillConfig {
+  /** 只补发最近几分钟的消息，更早的只写日志。 */
+  qqOfflineMinutes: number
 }
 
 export interface Config {
@@ -86,6 +116,9 @@ export interface Config {
   translate: TranslateConfig
   filter: FilterConfig
   glossary: GlossaryConfig
+  // 可选：0.4.1 新增，旧的测试配置里没有这两节，运行时按默认值处理
+  alert?: AlertConfig
+  backfill?: BackfillConfig
 }
 
 const str = (value = '') => Schema.string().default(value).loose()
@@ -128,8 +161,9 @@ export const Config: Schema<Config> = Schema.intersect([
       atAll: strictBool(false).description('@全体'),
       blockWords: str().description('屏蔽词（正则，多个用 ;; 分隔）'),
       translate: strictBool(false).description('翻译'),
+      qqBackfill: strictBool(false).description('QQ掉线补发'),
     }).default(INVALID_ROW).loose()).role('table').default([]).loose()
-      .description('一行一个桥：连接一个 Discord 频道和一个 QQ 群。一个 Discord 频道要发往两个 QQ 群就写两行。ID 必须是纯数字；写错的行会被跳过，并在 `bridge.status` 里标出来。**@全体** 只对 Discord → QQ 方向有效，只有真正的 @everyone / @here 才会触发。**翻译**：还要打开下面「翻译」里的总开关才生效。**屏蔽词**：每一条是一个正则表达式（普通的词直接写），不区分大小写，检查正文、embed 和文件名，命中就不转发这条。'),
+      .description('一行一个桥：连接一个 Discord 频道和一个 QQ 群。一个 Discord 频道要发往两个 QQ 群就写两行。ID 必须是纯数字；写错的行会被跳过，并在 `bridge.status` 里标出来。**@全体** 只对 Discord → QQ 方向有效，只有真正的 @everyone / @here 才会触发。**翻译**：还要打开下面「翻译」里的总开关才生效。**屏蔽词**：每一条是一个正则表达式（普通的词直接写），不区分大小写，检查正文、embed 和文件名，命中就不转发这条。**QQ掉线补发**：QQ 机器人没登录或断开时，这个桥 Discord → QQ 的消息先记下来，恢复后补发（时间窗口见下面「补发」）；不勾的桥照旧，QQ 没登录时发送失败就丢。'),
   }).description('桥'),
 
   Schema.object({
@@ -172,8 +206,10 @@ export const Config: Schema<Config> = Schema.intersect([
       context: Schema.string().role('textarea').default('').loose()
         .description('可选：给模型的背景说明，原样加在系统提示词的最后（英译中、中译英都加）。可以写聊天的场景和常见说法，例如「这是某游戏玩家之间的聊天，X = Y」。README 里有 EVE 用的参考写法。改了以后翻译缓存自动失效。'),
       protectMemberNames: bool(true)
-        .description('中译英时，QQ 群成员名片里的名字原样保留、不翻译（例如名片 `[ABC]某角色-小鱼干` 里的「小鱼干」）。只保护 3 个字及以上、含汉字的一段。成员名片每小时在后台更新一次，插件刚启动时的头几条消息可能还没有名片。'),
-    }).default({} as TranslateConfig).loose(),
+        .description('中译英时，QQ 群成员名片里的名字原样保留、不翻译（例如名片 `[ABC]某角色-小鱼干` 里的「小鱼干」）。只保护 3 个字及以上、含汉字的一段。成员名片每小时在后台更新一次，插件刚启动时的头几条消息可能还没有名片。名片里的交易广告（含「收」「售」「求购」「卖」，或者以「出」开头的一段，例如 `某某-收天使`）不当作名字。'),
+      memberNameIgnore: str()
+        .description('可选：这些词永远不当作名字（不保护、照常翻译），多个用 `;;` 分隔，不区分大小写，要和名片里的一段完全相同才算。适合名片里正好是普通词的情况，例如 `飞行员;;北极星`。`bridge.status -a` 会显示每个 QQ 群缓存了多少个名字，方便检查。'),
+    }).default({} as Required<TranslateConfig>).loose(),
   }).description('翻译'),
 
   Schema.object({
@@ -188,8 +224,38 @@ export const Config: Schema<Config> = Schema.intersect([
         .description('审核接口地址（只有 OpenAI 提供这个接口）。'),
       moderationApiKey: Schema.string().role('secret').default('').loose()
         .description('审核接口的 key。留空时，只有当翻译接口地址和审核接口地址完全相同（协议、主机、端口、路径）时才借用翻译的 key；否则必须填，插件绝不会把别家的 key 发给 OpenAI。'),
-    }).default({} as FilterConfig).loose(),
+      moderationDirections: Schema.union([
+        Schema.const('both' as const).description('两个方向'),
+        Schema.const('en2zh' as const).description('只审核英译中（Discord → QQ）'),
+        Schema.const('zh2en' as const).description('只审核中译英（QQ → Discord）'),
+      ]).default('both').loose()
+        .description('审核管哪个方向的译文。不审核的方向不送审，也不会因为没有审核密钥而不附译文。Discord → QQ 是把英文译成中文发进国内的 QQ 群，这个方向更需要谨慎；QQ → Discord 的原文本来就一字不差地转过去，审核只决定英文读者看不看得懂。'),
+      moderationIgnore: str()
+        .description('审核忽略的类别，多个用 `;;` 分隔，**按前缀匹配**：写 `illicit` 同时忽略 `illicit/violent`，写 `violence` 同时忽略 `violence/graphic`。只有不在这里的类别被标记，才算审核未通过。游戏社区建议写 `violence;;illicit`；sexual、hate、self-harm、harassment/threatening 这几类不建议忽略。默认空 = 任何类别被标记都不附译文。'),
+      moderationMinScore: str()
+        .description('可选：各类别需要达到的最低分数才算被标记，写成 `类别=分数`，多个用 `;;` 分隔，例如 `harassment=0.5`。类别名要完全相同（`harassment` 不影响 `harassment/threatening`）；没写的类别还是看审核结果里被标记的类别。写错的项忽略并在 `bridge.status` 里提示。'),
+    }).default({} as Required<FilterConfig>).loose(),
   }).description('过滤'),
+
+  Schema.object({
+    alert: Schema.object({
+      discordChannel: str()
+        .description('QQ 机器人掉线时，往这个 Discord 频道发提醒（填频道 ID，纯数字）。留空 = 不发。'),
+      discordUser: str()
+        .description('QQ 机器人掉线时，私信提醒这个 Discord 用户（填用户 ID，纯数字；对方要允许接收服务器成员的私信）。留空 = 不发。上面的频道和这一项可以同时填。'),
+      afterMinutes: num(10)
+        .description('QQ 机器人没登录、或和 LLBot 的连接断开，超过这么多分钟才提醒；同一次掉线只提醒一次，恢复后再发一条恢复通知。Discord 断开超过同样的时间时，在下面的 QQ 群里提醒。'),
+      qqGroup: str()
+        .description('可选：Discord 机器人断开超过上面的分钟数时，在这个 QQ 群里提醒（填群号，纯数字）。留空 = 不发。'),
+    }).default({} as AlertConfig).loose(),
+  }).description('掉线提醒'),
+
+  Schema.object({
+    backfill: Schema.object({
+      qqOfflineMinutes: num(30)
+        .description('QQ 掉线补发（桥表格里勾了「QQ掉线补发」的桥）：恢复后只补发最近这么多分钟里的消息，更早的不补，只在日志里写一行。补发的消息前缀带「（补发）」，不 @全体，有译文（受翻译的 `maxPerHour` 限制）。'),
+    }).default({} as BackfillConfig).loose(),
+  }).description('补发'),
 
   Schema.object({
     glossary: Schema.object({

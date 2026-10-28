@@ -659,9 +659,11 @@ describe('B7 失败处理和分段', () => {
     expect(env.relay.stats.get(`${DC_CHANNEL}:${QQ_GROUP}`).failures).toBe(1)
   })
 
-  it('QQ 发送超时 → 不重试', async () => {
+  it('QQ 发送超时、群里查不出有没有发出去 → 不重试', async () => {
+    // 0.4.1 V3：超时后会去群里核对；核对本身失败时仍然不重发（超时、核对后重发的情况见 v041-qq.test.ts）
     env = await setup()
     env.qq.faults.set('send_group_msg', 'timeout')
+    env.qq.faults.set('get_group_msg_history', 'fail')
     env.discordMessage({ content: 'x' })
     await env.idle()
     expect(sendCalls(env)).toHaveLength(1)

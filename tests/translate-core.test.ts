@@ -248,7 +248,8 @@ describe('翻译请求', () => {
     const tr = translator()
     const src = input('⟦0⟧ 到 ⟦1⟧ 集合', 'zh2en', { tokens: ['⟦0⟧', '⟦1⟧'] })
     for (const out of ['⟦0⟧ gather', '⟦0⟧ gather at ⟦1⟧ ⟦1⟧', '⟦0⟧ gather at ⟦1⟧ ⟦2⟧', '⟦0⟧ gather at ⟦ 1⟧']) {
-      llm.replies.push({ body: completion(out) })
+      // V12：占位符不符时同一个请求再发一次，两次都错才放弃
+      llm.replies.push({ body: completion(out) }, { body: completion(out) })
       expect(await tr.translate(src)).toEqual({ ok: false, reason: '占位符不符' })
     }
     llm.replies.push({ body: completion('Gather at ⟦1⟧, ⟦0⟧') })

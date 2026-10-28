@@ -52,16 +52,30 @@ export function structureNames(text: string, types: readonly string[]): string[]
   return [...out]
 }
 
+// 名片里的交易广告（V2）：含「收」「售」「求购」「卖」，或者以「出」开头（`收天使`、`出售辟邪`、`60M收旗舰`）
+const TRADE_AD = /收|售|求购|卖/
+
+/** 一段是不是交易广告（V2）。带「收」字的昵称也会因此不受保护，照常翻译，代价很小。 */
+export function isTradeAd(segment: string): boolean {
+  return TRADE_AD.test(segment) || segment.startsWith('出')
+}
+
+/** `translate.memberNameIgnore` 的比较形式：去首尾空白、小写，整段相同才算。 */
+export function ignoreSet(words: readonly string[] = []): Set<string> {
+  return new Set(words.map((w) => w.trim().toLowerCase()).filter(Boolean))
+}
+
 /**
  * 从一张群名片里取名字（U7）：去掉 `[]`、`【】` 里的简称，按 `-`、`_`、`|`、`/`、空白分段，
  * 只收 3 个字及以上、含汉字的段；isTerm 为真的段（和术语表原文相同）不收。
+ * V2：交易广告（见 isTradeAd）不收；ignore 里的词（整段相同）永远不收。
  */
-export function cardNames(card: string, isTerm: (text: string) => boolean = () => false): string[] {
+export function cardNames(card: string, isTerm: (text: string) => boolean = () => false, ignore: ReadonlySet<string> = new Set()): string[] {
   const stripped = card.replace(/\[[^\]]*\]|【[^】]*】/g, ' ')
   const out: string[] = []
   for (const seg of stripped.split(/[-_|/\s]+/)) {
     const name = seg.trim()
-    if ([...name].length >= 3 && HAN.test(name) && !isTerm(name)) out.push(name)
+    if ([...name].length >= 3 && HAN.test(name) && !isTerm(name) && !isTradeAd(name) && !ignore.has(name.toLowerCase())) out.push(name)
   }
   return out
 }
@@ -114,7 +128,7 @@ const MEMBER_TIMEOUT = 15000
  * 还没取到（插件刚启动后的第一条消息）或查询失败时返回空列表，照常翻译。
  */
 export class MemberNames {
-  private cache = new Map<string, { cards: string[]; at: number; loading: boolean }>()
+  private cache = new Map<string, { cards: string[]; at: number; loading: boolean; okAt: number; failed: boolean }>()
 
   constructor(private fetch: MemberFetch, private now: () => number = Date.now) {}
 
@@ -125,9 +139,19 @@ export class MemberNames {
     return entry?.cards ?? []
   }
 
+  /**
+   * 这个群缓存的情况（V2，给 bridge.status 看）：现在缓存的名片、上次成功刷新的时间（0 = 还没成功过）、
+   * 最近一次查询是不是失败了（失败时名片当作没有）。从没查过这个群时返回 null。不会触发刷新。
+   */
+  info(groupId: string): { cards: string[]; okAt: number; failed: boolean } | null {
+    const entry = this.cache.get(groupId)
+    if (!entry) return null
+    return { cards: entry.cards, okAt: entry.okAt, failed: entry.failed }
+  }
+
   /** 后台刷新（测试里可以直接 await）。 */
   async refresh(groupId: string): Promise<void> {
-    const entry = this.cache.get(groupId) ?? { cards: [], at: 0, loading: false }
+    const entry = this.cache.get(groupId) ?? { cards: [], at: 0, loading: false, okAt: 0, failed: false }
     if (entry.loading) return
     entry.loading = true
     this.cache.set(groupId, entry)
@@ -145,11 +169,13 @@ export class MemberNames {
         if (card) cards.add(card)
       }
       entry.cards = [...cards]
-      entry.at = this.now()
+      entry.at = entry.okAt = this.now()
+      entry.failed = false
     } catch {
       // 查询失败：当作没有名片，过一会儿再试
       entry.cards = []
       entry.at = this.now() - MEMBER_TTL + MEMBER_RETRY
+      entry.failed = true
     } finally {
       entry.loading = false
     }
@@ -164,20 +190,26 @@ function structureTypes(glossary: Glossary | null): string[] {
   return (fallbackTypes ??= structureTypeNames(loadEveData()))
 }
 
+/** 一批名片里所有的名字（去重）：和术语表原文相同的、交易广告、ignore 里的词都不算（U7、V2）。 */
+export function memberNameList(cards: readonly string[], glossary: Glossary | null, ignore: readonly string[] = []): string[] {
+  const isTerm = (seg: string) => glossary?.hasSource(seg, 'zh2en') ?? false
+  const skip = ignoreSet(ignore)
+  const out = new Set<string>()
+  for (const card of cards) for (const name of cardNames(card, isTerm, skip)) out.add(name)
+  return [...out]
+}
+
 /**
  * 这条消息翻译时要整段保护的名字的范围（U6、U7），交给 protect() 的 keep。
- * members：这个 QQ 群的成员名片（只在中译英、开关打开时给）。
+ * members：这个 QQ 群的成员名片（只在中译英、开关打开时给）；memberIgnore：永远不当作名字的词（V2）。
  */
 export function protectedNameRanges(
   text: string,
-  options: { direction: 'en2zh' | 'zh2en'; glossary: Glossary | null; spans?: string[]; members?: string[] },
+  options: { direction: 'en2zh' | 'zh2en'; glossary: Glossary | null; spans?: string[]; members?: string[]; memberIgnore?: string[] },
 ): Range[] {
   const names = [...dotlanNames(text), ...structureNames(text, structureTypes(options.glossary))]
   if (options.direction === 'zh2en' && options.members?.length) {
-    const isTerm = (seg: string) => options.glossary?.hasSource(seg, 'zh2en') ?? false
-    for (const card of options.members) {
-      for (const name of cardNames(card, isTerm)) if (text.includes(name)) names.push(name)
-    }
+    for (const name of memberNameList(options.members, options.glossary, options.memberIgnore)) if (text.includes(name)) names.push(name)
   }
   return nameRanges(text, names, options.spans ?? [])
 }
