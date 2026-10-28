@@ -6,7 +6,7 @@ import { readFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import type { Context } from 'koishi'
 import type { Settings } from '../bridges'
-import { KeywordFilter, Moderator, parseKeywordLines, resolveModerationKey } from '../filter'
+import { describeHits, KeywordFilter, Moderator, parseKeywordLines, resolveModerationKey } from '../filter'
 import { buildGlossary, Glossary, isUrlEntry, loadCommonWords, loadEveData, mergeSlangFiles, parseOnlineEveData, parseSlangYaml, splitSlangPaths, splitUrls } from '../glossary'
 import type { EveData, OnlineEveResult, SlangFileResult, SlangFileSummary } from '../glossary'
 import { OnlineSources } from '../online'
@@ -15,14 +15,15 @@ import { fixToEntry, loadFixRows } from '../fixes'
 import type { Msg } from '../types'
 import { Translator } from './client'
 import { keepValueRanges, protect, restore, restoreTerms, stripTokens } from './protect'
-import { MemberNames, protectedNameRanges } from './names'
+import { MemberNames, memberNameList, protectedNameRanges } from './names'
 import { isCommand, isRealCommand, rootPrefixes, skipReason } from './skip'
 
 export type TranslateDirection = 'en2zh' | 'zh2en'
 
 export type TranslationOutcome =
   | { ok: true; text: string }
-  | { ok: false; reason: string; skipped: boolean }
+  /** detail：补充说明，只写进 debug 日志（V8），例如审核未通过时被标记的类别和分数；不含原文。 */
+  | { ok: false; reason: string; skipped: boolean; detail?: string }
 
 const CACHE_SIZE = 1000
 const CACHE_TTL = 24 * 3600 * 1000
@@ -104,7 +105,7 @@ export class TranslationService {
   constructor(
     private ctx: Context,
     private getSettings: () => Settings,
-    private logger: { warn(...args: any[]): void; info(...args: any[]): void },
+    private logger: { warn(...args: any[]): void; info(...args: any[]): void; debug?(...args: any[]): void },
     private now: () => number = Date.now,
   ) {
     this.translator = new Translator(ctx.http, () => {
@@ -116,6 +117,8 @@ export class TranslationService {
       return {
         baseURL: s.filter.moderationBaseURL,
         apiKey: resolveModerationKey(s.translate.baseURL, s.translate.apiKey, s.filter.moderationBaseURL, s.filter.moderationApiKey),
+        ignore: s.filter.moderationIgnore,
+        minScore: s.filter.moderationMinScore,
       }
     })
     this.online = new OnlineSources(ctx, logger, (kind, text) => this.checkOnline(kind, text), now)
@@ -160,10 +163,16 @@ export class TranslationService {
     this.online.dispose()
   }
 
-  /** 审核打开却没有可用的 key（清单 §4.5）。 */
-  moderationKeyMissing() {
+  /** 这个方向的译文要不要送审（V5）：审核打开，并且 moderationDirections 管这个方向；不带方向时问「有没有哪个方向要审」。 */
+  moderates(direction?: TranslateDirection) {
+    const { moderation, moderationDirections } = this.getSettings().filter
+    return moderation && (!direction || moderationDirections === 'both' || moderationDirections === direction)
+  }
+
+  /** 审核打开却没有可用的 key（清单 §4.5）。只看要审核的方向（V5）。 */
+  moderationKeyMissing(direction?: TranslateDirection) {
     const s = this.getSettings()
-    return s.filter.moderation && !resolveModerationKey(s.translate.baseURL, s.translate.apiKey, s.filter.moderationBaseURL, s.filter.moderationApiKey)
+    return this.moderates(direction) && !resolveModerationKey(s.translate.baseURL, s.translate.apiKey, s.filter.moderationBaseURL, s.filter.moderationApiKey)
   }
 
   private path(file: string) {
@@ -207,7 +216,10 @@ export class TranslationService {
     if (s.translate.enabled && !filter.size) {
       problems.push('翻译已打开，但关键词表是空的（建议按服务商的要求设置关键词过滤）')
     }
-    if (this.moderationKeyMissing()) problems.push('审核未配置密钥，译文全部不附')
+    if (this.moderationKeyMissing()) {
+      const only = { both: '', en2zh: '英译中的', zh2en: '中译英的' }[s.filter.moderationDirections]
+      problems.push(`审核未配置密钥，${only}译文全部不附`)
+    }
     // 术语表
     // 黑话表可以有多个文件（`;;` 分隔，T8）：每个文件单独读、单独报错，后面文件的同一个原文覆盖前面的
     const paths = splitSlangPaths(s.glossary.slangFile)
@@ -300,9 +312,29 @@ export class TranslationService {
     return { ok: false, reason, skipped: true }
   }
 
-  private fail(reason: string): TranslationOutcome {
+  private fail(reason: string, detail?: string): TranslationOutcome {
     this.count(reason)
-    return { ok: false, reason, skipped: false }
+    return detail ? { ok: false, reason, skipped: false, detail } : { ok: false, reason, skipped: false }
+  }
+
+  /**
+   * 没附译文的消息在 debug 日志里记一行（V8）：桥的序号、方向、源消息 ID、原因（审核未通过时带类别和分数）。
+   * 不写原文；info 以上不写，免得日志变大。
+   */
+  logMissing(bridgeIndex: number, msg: Pick<Msg, 'platform' | 'messageId'> | null, outcome: { reason: string; detail?: string }) {
+    if (!msg) return
+    const direction = msg.platform === 'discord' ? 'd2q' : 'q2d'
+    this.logger.debug?.(`没附译文 [第 ${bridgeIndex} 个桥 ${direction} 消息 ${msg.messageId}]：${outcome.reason}${outcome.detail ? `（${outcome.detail}）` : ''}`)
+  }
+
+  /**
+   * 这个 QQ 群缓存的名字（V2，给 bridge.status 看）：现在能当作名字的有几个、上次成功刷新的时间（0 = 还没成功过）、最近一次查询是否失败。
+   * 从没查过这个群时返回 null。
+   */
+  memberNameInfo(groupId: string): { count: number; okAt: number; failed: boolean } | null {
+    const info = this.memberNames?.info(groupId)
+    if (!info) return null
+    return { count: memberNameList(info.cards, this.glossary, this.getSettings().translate.memberNameIgnore).length, okAt: info.okAt, failed: info.failed }
   }
 
   private prefixes(): string[] {
@@ -322,20 +354,22 @@ export class TranslationService {
     const fields = source === msg.translatable ? msg.fields : undefined
     // U6、U7：dotlan 链接里的军团名、建筑通知里的建筑名、QQ 群友名片里的名字也整段保护（只影响翻译输入）
     const members = direction === 'zh2en' && msg.platform === 'onebot' && this.getSettings().translate.protectMemberNames ? this.memberNames?.cards(msg.channelId) : undefined
-    const names = protectedNameRanges(source, { direction, glossary: this.glossary, spans: msg.protect, members })
+    const names = protectedNameRanges(source, { direction, glossary: this.glossary, spans: msg.protect, members, memberIgnore: this.getSettings().translate.memberNameIgnore })
     const guarded = protect(source, msg.protect ?? [], [...keepValueRanges(source, this.getSettings().translate.keepValueLabels, fields), ...names])
     const applied = this.glossary?.apply(guarded.text, direction) ?? { text: guarded.text, tokens: [], hints: [] }
     const stripped = stripTokens(applied.text)
     // 跳过判断只去掉保护用的占位符：术语（例如 Jita、Rifter）要算作文字
-    const skip = skipReason(stripTokens(guarded.text), direction)
+    let skip = skipReason(stripTokens(guarded.text), direction)
+    // V6：术语换完、所有占位符（保护的和术语的）都去掉以后没有文字了（「Mexallon 6200000?」），不算太短，走下面的本地术语那条路
+    if (skip === '太短' && !HAN_OR_LETTER.test(stripped)) skip = null
     if (skip) return this.skip(skip)
 
-    if (this.moderationKeyMissing()) return this.skip('审核未配置密钥')
+    if (this.moderationKeyMissing(direction)) return this.skip('审核未配置密钥')
     // B3：去掉所有占位符（保护 + 术语）后没有文字 → 不请求服务商；术语换完后和原文不同就本地生成译文
     if (!HAN_OR_LETTER.test(stripped)) {
       const local = trimLines(restore(restoreTerms(applied.text, applied.tokens), guarded.tokens))
       if (!local || normalizeForCompare(local) === normalizeForCompare(source)) return this.skip('只有术语')
-      return this.finish(local, stripTokens(restoreTerms(applied.text, applied.tokens)), source, null)
+      return this.finish(local, stripTokens(restoreTerms(applied.text, applied.tokens)), source, null, direction)
     }
     // 保留标签、背景说明（U2）改了之后译文也要重新生成，所以一起算进缓存 key
     // 被保护的内容（名片、建筑名等）变了，发给模型的文字就不同，所以 guarded.text 也算进 key
@@ -368,21 +402,22 @@ export class TranslationService {
     }
     const text = trimLines(restore(restoreTerms(result.text, applied.tokens), guarded.tokens))
     // 送审的文字不带被保护的内容（用户名、QQ 号、网址等），只还原术语
-    return this.finish(text, stripTokens(restoreTerms(result.text, applied.tokens)), source, key)
+    return this.finish(text, stripTokens(restoreTerms(result.text, applied.tokens)), source, key, direction)
   }
 
   /** 译文的最后几步：和原文比较、关键词、审核、缓存。key 为 null 时不缓存（本地生成的译文）。 */
-  private async finish(text: string, forModeration: string, source: string, key: string | null): Promise<TranslationOutcome> {
+  private async finish(text: string, forModeration: string, source: string, key: string | null, direction: TranslateDirection): Promise<TranslationOutcome> {
     if (!text) return this.fail('空结果')
     if (normalizeForCompare(text) === normalizeForCompare(source)) {
       if (key) this.remember(key, null)
       return this.skip('译文与原文相同')
     }
     if (this.keywords?.matches(text)) return this.fail('关键词命中译文')
-    if (this.getSettings().filter.moderation) {
+    // V5：只审核 moderationDirections 管的方向；不审核的方向直接跳过这一步
+    if (this.moderates(direction)) {
       const checked = await this.moderator.check(forModeration)
       if (!checked.ok) return this.fail(checked.reason)
-      if (checked.flagged) return this.fail('审核未通过')
+      if (checked.flagged) return this.fail('审核未通过', checked.hits?.length ? describeHits(checked.hits) : '未标明类别')
     }
     if (key) this.remember(key, text)
     this.count('成功')

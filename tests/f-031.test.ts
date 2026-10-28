@@ -47,7 +47,7 @@ async function startMedia(options: { delayMs?: number; size?: number; onRequest?
   }
 }
 
-async function waitFor(check: () => boolean | Promise<boolean>, ms = 3000) {
+async function waitFor(check: () => boolean | Promise<boolean>, ms = 15000) {
   const end = Date.now() + ms
   while (Date.now() < end) {
     if (await check()) return

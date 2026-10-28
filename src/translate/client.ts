@@ -1,5 +1,5 @@
 // 翻译请求（清单 §12.1 第 4、5、8 步）：OpenAI 兼容的 chat/completions，只发要翻译的文字和术语参考，
-// 不传 temperature；校验译文，失败只返回原因（不重试，429/5xx 在超时内重试 1 次）。不记录请求和响应内容。
+// 不传 temperature；校验译文，失败只返回原因（429/5xx 在超时内重试 1 次；译文的占位符不符时整个请求重发 1 次，V12）。不记录请求和响应内容。
 
 export interface TranslatorConfig {
   baseURL: string
@@ -29,6 +29,9 @@ export interface TranslateInput {
   /** 去掉占位符后的原文（长度、拒绝检查用）。 */
   sourceForChecks: string
 }
+
+/** 占位符不符后重发时加在用户消息最前面的一句（V12）。 */
+const PLACEHOLDER_RETRY_NOTE = '上次的译文漏掉或改动了占位符，这次务必原样保留每个 ⟦…⟧。'
 
 const RULES = '只翻译 <text> 和 </text> 之间的内容。形如 ⟦0⟧、⟦G0⟧ 的占位符必须原样保留，不能改动、删除或增加。玩家和角色名、军团和联盟名及其简称、舰队制式名、语音频道名一律不翻译、不音译，原样保留。保留原文的换行。只输出译文，不要解释，不要加任何说明或标签。'
 const SYSTEM: Record<TranslateInput['direction'], string> = {
@@ -214,16 +217,31 @@ export class Translator {
   }
 
   private async send(input: TranslateInput, config: TranslatorConfig, deadline: number): Promise<TranslateResult> {
+    let result = await this.request(input, config, deadline, false)
+    // V12：占位符不符多半是模型偶尔出错，同一个请求（加一句提醒）再发一次；第二次还不通过再放弃。
+    // 重试和第一次一样占每小时名额、算请求数和用量；名额用完或时间不够、没能发出去时，原因仍是「占位符不符」
+    if (!result.ok && result.reason === '占位符不符') {
+      const retried = await this.request(input, config, deadline, true)
+      if (!('notSent' in retried)) result = retried
+    }
+    return result.ok ? result : this.fail(result.reason)
+  }
+
+  /**
+   * 发一次请求并校验译文。失败不计入失败统计（由 send 在最终放弃时计）；retryNote 为真时在用户消息最前面加提醒。
+   * 没发出去（时间用完、每小时名额用完）时带 notSent。
+   */
+  private async request(input: TranslateInput, config: TranslatorConfig, deadline: number, retryNote: boolean): Promise<TranslateResult | { ok: false; reason: string; notSent: true }> {
     const left0 = deadline - Date.now()
-    if (left0 <= 0) return this.fail('超时')
-    if (!this.takeQuota(Math.max(0, Number(config.maxPerHour) || 0))) return this.fail('超过每小时上限')
+    if (left0 <= 0) return { ok: false, reason: '超时', notSent: true }
+    if (!this.takeQuota(Math.max(0, Number(config.maxPerHour) || 0))) return { ok: false, reason: '超过每小时上限', notSent: true }
     this.counters.requests++
 
     const url = `${String(config.baseURL).trim().replace(/\/+$/, '')}/chat/completions`
     const headers: Record<string, string> = {}
     if (config.apiKey) headers.Authorization = `Bearer ${config.apiKey}`
     const hints = input.hints.slice(0, 30)
-    const user = (hints.length ? `术语参考：\n${hints.join('\n')}\n\n` : '') + `<text>${input.text}</text>`
+    const user = (retryNote ? `${PLACEHOLDER_RETRY_NOTE}\n\n` : '') + (hints.length ? `术语参考：\n${hints.join('\n')}\n\n` : '') + `<text>${input.text}</text>`
     const body = {
       ...(config.extraBody ?? {}),
       model: config.model,
@@ -242,7 +260,7 @@ export class Translator {
         result = await this.attempt(url, headers, body, left)
       }
     }
-    if (result.kind !== 'ok') return this.fail(result.reason)
+    if (result.kind !== 'ok') return { ok: false, reason: result.reason }
 
     const data = parseData(result.data)
     const promptTokens = Number(data?.usage?.prompt_tokens)
@@ -253,10 +271,10 @@ export class Translator {
 
     const content = data?.choices?.[0]?.message?.content
     const text = typeof content === 'string' ? unwrap(content) : ''
-    if (!text) return this.fail('空结果')
-    if (!placeholdersMatch(input.text, text, input.tokens)) return this.fail('占位符不符')
-    if (!lengthOk(text, input.sourceForChecks, input.direction)) return this.fail('长度异常')
-    if (refused(text, [input.sourceForChecks, input.text])) return this.fail('拒绝翻译')
+    if (!text) return { ok: false, reason: '空结果' }
+    if (!placeholdersMatch(input.text, text, input.tokens)) return { ok: false, reason: '占位符不符' }
+    if (!lengthOk(text, input.sourceForChecks, input.direction)) return { ok: false, reason: '长度异常' }
+    if (refused(text, [input.sourceForChecks, input.text])) return { ok: false, reason: '拒绝翻译' }
     return { ok: true, text, ...usage }
   }
 }
